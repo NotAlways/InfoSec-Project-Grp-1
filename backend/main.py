@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 from datetime import datetime
 
-# Database setup
+# Database setup, change to your own password here. Make sure PostgreSQL is running. To be encrypted in the future. 
 DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/notevault"
 Base = declarative_base()
 
