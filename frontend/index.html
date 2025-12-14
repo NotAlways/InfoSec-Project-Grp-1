@@ -20,8 +20,12 @@
     <!-- Sections -->
     <div id="notes" class="section">
     <h2>Notes</h2>
-    <textarea id="noteContent"></textarea>
-    <button onclick="saveNote()">Save Note</button>
+    <input type="text" id="noteTitle" placeholder="Note title">
+    <textarea id="noteContent" placeholder="Note content"></textarea>
+    <button id="saveBtn" onclick="saveNote()">Save Note</button>
+    <button onclick="clearNoteForm()">Clear</button>
+    <hr>
+    <h3>Your Notes</h3>
     <div id="noteList"></div>
     </div>
 
