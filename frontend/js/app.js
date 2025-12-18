@@ -1,4 +1,4 @@
-const API_URL = "http://localhost:8000";
+const API_URL = "https://localhost:8000";
 let currentNoteId = null;
 
 function showSection(sectionId) {
@@ -22,43 +22,61 @@ async function saveNote() {
   try {
     if (currentNoteId) {
       // Update existing note
+      console.log(`Updating note ${currentNoteId}...`);
       const response = await fetch(`${API_URL}/notes/${currentNoteId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title, content })
       });
+      console.log(`Response status: ${response.status}`);
       if (response.ok) {
         alert("Note updated!");
         clearNoteForm();
         loadNotes();
       } else {
-        alert("Failed to update note");
+        const error = await response.text();
+        console.error("Update failed:", error);
+        alert(`Failed to update note: ${response.status} - ${error}`);
       }
     } else {
       // Create new note
+      console.log("Creating new note...");
       const response = await fetch(`${API_URL}/notes`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title, content })
       });
+      console.log(`Response status: ${response.status}`);
       if (response.ok) {
         alert("Note saved!");
         clearNoteForm();
         loadNotes();
       } else {
-        alert("Failed to save note");
+        const error = await response.text();
+        console.error("Create failed:", error);
+        alert(`Failed to save note: ${response.status} - ${error}`);
       }
     }
   } catch (error) {
-    console.error("Error:", error);
-    alert("Error saving note");
+    console.error("Network/Parse Error:", error);
+    alert(`Error saving note: ${error.message}`);
   }
 }
 
 async function loadNotes() {
   try {
+    console.log("Loading notes from " + API_URL + "/notes");
     const response = await fetch(`${API_URL}/notes`);
+    console.log(`GET /notes response status: ${response.status}`);
+    
+    if (!response.ok) {
+      const error = await response.text();
+      console.error(`Failed to load notes: ${response.status} - ${error}`);
+      return;
+    }
+    
     const notes = await response.json();
+    console.log(`Loaded ${notes.length} notes`);
     const noteList = document.getElementById("noteList");
     noteList.innerHTML = "";
 
@@ -74,7 +92,7 @@ async function loadNotes() {
       noteList.appendChild(noteItem);
     });
   } catch (error) {
-    console.error("Error loading notes:", error);
+    console.error("Network/Parse Error loading notes:", error);
   }
 }
 
