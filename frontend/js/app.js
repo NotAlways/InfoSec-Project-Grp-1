@@ -1,6 +1,13 @@
 const API_URL = "https://localhost:8000";
 let currentNoteId = null;
 
+// Load notes when page first loads
+document.addEventListener("DOMContentLoaded", function() {
+  console.log("Page loaded, initializing...");
+  showSection("notes");
+  loadNotes();
+});
+
 function showSection(sectionId) {
   const sections = document.querySelectorAll(".section");
   sections.forEach(sec => sec.style.display = "none");
