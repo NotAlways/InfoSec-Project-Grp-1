@@ -5,10 +5,20 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 from datetime import datetime
+from crypto import load_key, encrypt_content, decrypt_content
 
-# Database setup, change to your own password here. Make sure PostgreSQL is running. To be encrypted in the future. 
+# Database setup, change to your own password here. Make sure PostgreSQL is running.
 DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/notevault"
 Base = declarative_base()
+
+# Load encryption key on startup
+encryption_key = None
+
+def get_encryption_key():
+    global encryption_key
+    if encryption_key is None:
+        encryption_key = load_key()
+    return encryption_key
 
 # Models
 class Note(Base):
@@ -63,7 +73,9 @@ async def startup():
 
 @app.post("/notes", response_model=NoteResponse)
 async def create_note(note: NoteSchema, db: AsyncSession = Depends(get_db)):
-    new_note = Note(title=note.title, content=note.content)
+    key = get_encryption_key()
+    encrypted_content = encrypt_content(note.content, key)
+    new_note = Note(title=note.title, content=encrypted_content)
     db.add(new_note)
     await db.commit()
     await db.refresh(new_note)
@@ -72,33 +84,43 @@ async def create_note(note: NoteSchema, db: AsyncSession = Depends(get_db)):
 @app.get("/notes", response_model=list[NoteResponse])
 async def get_notes():
     from sqlalchemy import select
+    key = get_encryption_key()
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Note))
-        return result.scalars().all()
+        notes = result.scalars().all()
+        # Decrypt content for each note
+        for note in notes:
+            note.content = decrypt_content(note.content, key)
+        return notes
 
 @app.get("/notes/{note_id}", response_model=NoteResponse)
 async def get_note(note_id: int):
     from sqlalchemy import select
+    key = get_encryption_key()
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Note).filter(Note.id == note_id))
         note = result.scalar_one_or_none()
         if not note:
             raise HTTPException(status_code=404, detail="Note not found")
+        note.content = decrypt_content(note.content, key)
         return note
 
 @app.put("/notes/{note_id}", response_model=NoteResponse)
 async def update_note(note_id: int, note: NoteSchema):
     from sqlalchemy import select
+    key = get_encryption_key()
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Note).filter(Note.id == note_id))
         db_note = result.scalar_one_or_none()
         if not db_note:
             raise HTTPException(status_code=404, detail="Note not found")
         db_note.title = note.title
-        db_note.content = note.content
+        db_note.content = encrypt_content(note.content, key)
         db_note.updated_at = datetime.utcnow()
         await session.commit()
         await session.refresh(db_note)
+        # Decrypt for response
+        db_note.content = decrypt_content(db_note.content, key)
         return db_note
 
 @app.delete("/notes/{note_id}")
