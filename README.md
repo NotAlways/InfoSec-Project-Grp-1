@@ -1,2 +1,2 @@
 # InfoSec-Project-Grp-1
-# To run, u need to install postresql , run CREATE DATABASE notevault;, change the default password to your set password in main.py, then start the backend with 'python -m uvicorn backend.main:app --reload' in terminal. Then navigate to index.html in your file explorer and open with browser. 
+# To run, u need to install postresql , run CREATE DATABASE notevault;, change the default password to your set password in main.py, then start the backend doing 'cd backend' then 'python -m uvicorn main:app --reload' in terminal. Then navigate to index.html in your file explorer and open with browser. 
