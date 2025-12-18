@@ -92,24 +92,30 @@ def decrypt_content(encrypted: str, key: bytes) -> str:
     Returns:
         Decrypted plaintext string
     """
+    # If the stored value does not match the expected encrypted format
+    # (nonce:ciphertext:tag), assume it's plaintext and return it unchanged.
+    if not isinstance(encrypted, str) or ":" not in encrypted:
+        return encrypted
+
     try:
         # Split the encrypted string
         nonce_b64, ciphertext_b64, tag_b64 = encrypted.split(":")
-        
+
         # Decode from base64
         nonce = base64.b64decode(nonce_b64)
         actual_ciphertext = base64.b64decode(ciphertext_b64)
         tag = base64.b64decode(tag_b64)
-        
+
         # Reconstruct full ciphertext (ciphertext + tag for AESGCM)
         full_ciphertext = actual_ciphertext + tag
-        
+
         # Create cipher and decrypt
         cipher = AESGCM(key)
         plaintext = cipher.decrypt(nonce, full_ciphertext, None)
-        
+
         return plaintext.decode('utf-8')
-    except (ValueError, IndexError) as e:
+    except Exception as e:
+        # If decryption fails, raise a clear error so callers can handle it.
         raise ValueError(f"Failed to decrypt content: {e}")
 
 def key_exists() -> bool:
