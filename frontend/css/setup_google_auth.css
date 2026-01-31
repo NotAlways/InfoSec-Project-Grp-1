@@ -1,0 +1,162 @@
+body {
+    font-family: Arial, sans-serif;
+    background-color: #f4f4f4;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    margin: 0;
+}
+
+.setup-container {
+    background: white;
+    width: 100%;
+    max-width: 450px;
+    padding: 40px;
+    margin: 20px;
+    border-radius: 5px;
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+    box-sizing: border-box;
+}
+
+h2 {
+    text-align: center;
+    margin-bottom: 20px;
+    color: #333;
+}
+
+h3 {
+    font-size: 1rem;
+    margin-bottom: 5px;
+    color: #444;
+}
+
+/* Instructions */
+.instructions {
+    margin-bottom: 25px;
+    background: #f9f9f9;
+    padding-top: 5px;
+    padding-left: 15px;
+    padding-right: 15px;
+    padding-bottom: 22.5px;
+    border-radius: 4px;
+}
+
+.instructions ol {
+    margin: 0;
+    padding-left: 20px;
+    font-size: 14px;
+    color: #666;
+    line-height: 1.6;
+}
+
+/* QR Code */
+.qr-code {
+    text-align: center;
+    margin-bottom: 25px;
+}
+
+.qr-code img {
+    border: 1px solid #ddd;
+    background: #fff;
+    border-radius: 4px;
+}
+
+/* Secret Key Section */
+.secret-section {
+    margin-bottom: 25px;
+    text-align: center;
+}
+
+.secret-key {
+    display: inline-block;
+    background: #f1f1f1;
+    padding: 10px;
+    border: 1px dashed #ccc;
+    font-family: monospace;
+    font-size: 1.1rem;
+    color: #333;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+/* Form Styling */
+.form-group {
+    margin-bottom: 20px;
+}
+
+label {
+    display: block;
+    margin-bottom: 8px;
+    font-size: 14px;
+}
+
+input[type="text"] {
+    width: 100%;
+    padding: 12px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    box-sizing: border-box;
+    font-size: 18px;
+    text-align: center;
+    letter-spacing: 2px;
+}
+
+/* Buttons (Matching NoteVault Green) */
+button {
+    width: 100%;
+    padding: 12px;
+    margin-top: 10px;
+    background-color: #5cb85c;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+    transition: background 0.3s;
+}
+
+button:hover {
+    background-color: #4cae4c;
+}
+
+button.cancel {
+    background-color: #f4f4f4;
+    color: #666;
+    border: 1px solid #ddd;
+    margin-top: 5px;
+}
+
+button.cancel:hover {
+    background-color: #e9e9e9;
+}
+
+.cancel-link {
+    text-decoration: none;
+}
+
+/* Errors */
+.error {
+    background-color: #f2dede;
+    color: #a94442;
+    padding: 12px;
+    border-radius: 4px;
+    margin-top: 20px;
+    text-align: center;
+    border: 1px solid #ebccd1;
+    font-size: 14px;
+}
+
+/* #backup_link {
+    text-decoration: none;
+    color: #5cb85c;
+}
+
+#backup{
+    position: center;
+    margin-top: 20px;
+    margin-left: 37.5px;
+    color: #666;
+    font-size: 14px;
+    line-height: 1.5;
+} */

@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NoteVault - Passkey Verification</title>
+    <link rel="stylesheet" href="/static/css/biometric.css" />
+</head>
+
+<body>
+    <div class="biometric-container">
+        <h1 id="page-title">Passkey Verification</h1>
+        <p id="page-desc">Use your device biometrics (Windows Hello / Touch ID / Face ID) to continue</p>
+
+        <div id="status-message" class="status-text">Preparing...</div>
+
+        <div class="action-buttons">
+            <button id="action-btn" type="button">Continue</button>
+            <button id="cancel-btn" type="button" class="back-link">Cancel</button>
+        </div>
+    </div>
+
+    <script>
+        const actionBtn = document.getElementById("action-btn");
+        const cancelBtn = document.getElementById("cancel-btn");
+        const statusMsg = document.getElementById("status-message");
+        const pageTitle = document.getElementById("page-title");
+        const pageDesc = document.getElementById("page-desc");
+
+        // From Jinja
+        const MODE = "{{ mode or '' }}";    // "register" or "login"
+        const EMAIL = "{{ email or '' }}";
+
+        const isRegister = MODE === "register";
+        const isLogin = MODE === "login";
+
+        let busy = false;
+
+        function setStatus(text, color = "#333") {
+            statusMsg.innerText = text;
+            statusMsg.style.color = color;
+        }
+
+        function safeCancelRedirect() {
+            if (window.history.length > 1) return window.history.back();
+            window.location.href = "/admin";
+        }
+
+        function bufferToBase64url(buffer) {
+            const bytes = new Uint8Array(buffer);
+            let str = "";
+            for (const b of bytes) str += String.fromCharCode(b);
+            const b64 = btoa(str);
+            return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+        }
+
+        function base64urlToBuffer(base64url) {
+            let b64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
+            while (b64.length % 4) b64 += "=";
+            const binary = atob(b64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            return bytes.buffer;
+        }
+
+        // Convert server JSON options to ArrayBuffers
+        function preformatCreateOptions(publicKey) {
+            publicKey.challenge = base64urlToBuffer(publicKey.challenge);
+
+            if (publicKey.user && publicKey.user.id) {
+                publicKey.user.id = base64urlToBuffer(publicKey.user.id);
+            }
+
+            if (publicKey.excludeCredentials && Array.isArray(publicKey.excludeCredentials)) {
+                publicKey.excludeCredentials = publicKey.excludeCredentials.map((c) => {
+                    return { ...c, id: base64urlToBuffer(c.id) };
+                });
+            }
+
+            return publicKey;
+        }
+
+        function preformatGetOptions(publicKey) {
+            publicKey.challenge = base64urlToBuffer(publicKey.challenge);
+
+            if (publicKey.allowCredentials && Array.isArray(publicKey.allowCredentials)) {
+                publicKey.allowCredentials = publicKey.allowCredentials.map((c) => {
+                    return { ...c, id: base64urlToBuffer(c.id) };
+                });
+            }
+
+            return publicKey;
+        }
+
+        function buildRegistrationPayload(cred) {
+            return {
+                id: cred.id, // base64url string from browser
+                rawId: bufferToBase64url(cred.rawId),
+                type: cred.type,
+                response: {
+                    clientDataJSON: bufferToBase64url(cred.response.clientDataJSON),
+                    attestationObject: bufferToBase64url(cred.response.attestationObject),
+                },
+                transports: (cred.response.getTransports && cred.response.getTransports()) || undefined,
+                clientExtensionResults: cred.getClientExtensionResults(),
+            };
+        }
+
+        function buildAuthenticationPayload(cred) {
+            return {
+                id: cred.id, // base64url string from browser
+                rawId: bufferToBase64url(cred.rawId),
+                type: cred.type,
+                response: {
+                    clientDataJSON: bufferToBase64url(cred.response.clientDataJSON),
+                    authenticatorData: bufferToBase64url(cred.response.authenticatorData),
+                    signature: bufferToBase64url(cred.response.signature),
+                    userHandle: cred.response.userHandle ? bufferToBase64url(cred.response.userHandle) : null,
+                },
+                clientExtensionResults: cred.getClientExtensionResults(),
+            };
+        }
+
+        async function doRegister() {
+            if (busy) return;
+            busy = true;
+
+            setStatus("Loading passkey registration...", "#333");
+            actionBtn.disabled = true;
+
+            try {
+                const optRes = await fetch("/webauthn/register/options", {
+                    method: "GET",
+                    credentials: "include",
+                    cache: "no-store",
+                });
+
+                let optData = null;
+                try { optData = await optRes.json(); } catch { }
+
+                if (!optRes.ok || !optData || !optData.publicKey || !optData.session_id) {
+                    const msg = (optData && (optData.detail || optData.message)) || "Failed to start passkey enrollment.";
+                    setStatus(msg, "#d9534f");
+                    actionBtn.disabled = false;
+                    busy = false;
+                    return;
+                }
+
+                const session_id = optData.session_id;
+                const publicKey = preformatCreateOptions(optData.publicKey);
+
+                setStatus("Use your device biometrics to create a passkey...", "#333");
+
+                let cred = null;
+                try {
+                    cred = await navigator.credentials.create({ publicKey });
+                } catch (e) {
+                    setStatus("Passkey enrollment cancelled / failed", "#d9534f");
+                    actionBtn.disabled = false;
+                    busy = false;
+                    return;
+                }
+
+                setStatus("Finalizing enrollment...", "#333");
+
+                const verifyRes = await fetch("/webauthn/register/verify", {
+                    method: "POST",
+                    credentials: "include",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        session_id,
+                        credential: buildRegistrationPayload(cred),
+                    }),
+                });
+
+                let verifyData = null;
+                try { verifyData = await verifyRes.json(); } catch { }
+
+                if (verifyRes.ok && verifyData && verifyData.success) {
+                    setStatus(verifyData.message || "Passkey enrolled successfully!", "#5cb85c");
+                    if (verifyData.redirect) {
+                        window.location.href = verifyData.redirect;
+                        return;
+                    }
+                    actionBtn.disabled = false;
+                    busy = false;
+                    return;
+                }
+
+                const msg = (verifyData && (verifyData.detail || verifyData.message)) || "Passkey enrollment failed.";
+                setStatus(msg, "#d9534f");
+                actionBtn.disabled = false;
+                busy = false;
+
+            } catch (e) {
+                setStatus("Network / server error while enrolling passkey.", "#d9534f");
+                actionBtn.disabled = false;
+                busy = false;
+            }
+        }
+
+        async function doLogin() {
+            if (busy) return;
+            busy = true;
+
+            setStatus("Loading passkey verification...", "#333");
+            actionBtn.disabled = true;
+
+            try {
+                const optRes = await fetch("/webauthn/login/options", {
+                    method: "GET",
+                    credentials: "include",
+                    cache: "no-store",
+                });
+
+                let optData = null;
+                try { optData = await optRes.json(); } catch { }
+
+                if (!optRes.ok || !optData || !optData.publicKey || !optData.session_id) {
+                    const msg = (optData && (optData.detail || optData.message)) || "Failed to start passkey verification.";
+                    setStatus(msg, "#d9534f");
+                    actionBtn.disabled = false;
+                    busy = false;
+                    return;
+                }
+
+                const session_id = optData.session_id;
+                const publicKey = preformatGetOptions(optData.publicKey);
+
+                setStatus("Use your device biometrics to verify...", "#333");
+
+                let cred = null;
+                try {
+                    cred = await navigator.credentials.get({ publicKey });
+                } catch (e) {
+                    setStatus("Passkey verification cancelled / failed", "#d9534f");
+                    actionBtn.disabled = false;
+                    busy = false;
+                    return;
+                }
+
+                setStatus("Finalizing verification...", "#333");
+
+                const verifyRes = await fetch("/webauthn/login/verify", {
+                    method: "POST",
+                    credentials: "include",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        session_id,
+                        credential: buildAuthenticationPayload(cred),
+                    }),
+                });
+
+                let verifyData = null;
+                try { verifyData = await verifyRes.json(); } catch { }
+
+                if (verifyRes.ok && verifyData && verifyData.success) {
+                    setStatus(verifyData.message || "Verified!", "#5cb85c");
+                    window.location.href = verifyData.redirect || "/admin";
+                    return;
+                }
+
+                const msg = (verifyData && (verifyData.detail || verifyData.message)) || "Passkey verification failed.";
+                setStatus(msg, "#d9534f");
+                actionBtn.disabled = false;
+                busy = false;
+
+            } catch (e) {
+                setStatus("Network / server error while verifying passkey.", "#d9534f");
+                actionBtn.disabled = false;
+                busy = false;
+            }
+        }
+
+        // Init
+        cancelBtn.addEventListener("click", safeCancelRedirect);
+
+        if (!("credentials" in navigator) || !window.PublicKeyCredential) {
+            pageTitle.innerText = "Passkey Not Supported";
+            pageDesc.innerText = "Your browser/device does not support platform passkeys (WebAuthn).";
+            setStatus("Please use Chrome/Edge/Safari and enable biometrics.", "#d9534f");
+            actionBtn.disabled = true;
+
+        } else if (isRegister) {
+            document.title = "NoteVault - Enroll Passkey";
+            pageTitle.innerText = "Enroll Passkey";
+            pageDesc.innerText = EMAIL ? `Enrolling passkey for: ${EMAIL}` : "Enroll a platform passkey to continue";
+            actionBtn.innerText = "Enroll Passkey";
+            setStatus("Ready. Click Enroll Passkey.", "#333");
+            actionBtn.addEventListener("click", doRegister);
+
+        } else if (isLogin) {
+            document.title = "NoteVault - Verify Passkey";
+            pageTitle.innerText = "Verify Passkey";
+            pageDesc.innerText = "Verify using your platform biometrics to access Admin Panel";
+            actionBtn.innerText = "Verify Passkey";
+            setStatus("Ready. Click Verify Passkey.", "#333");
+            actionBtn.addEventListener("click", doLogin);
+
+        } else {
+            pageTitle.innerText = "Passkey";
+            pageDesc.innerText = "Invalid mode.";
+            setStatus("Invalid mode from server.", "#d9534f");
+            actionBtn.disabled = true;
+        }
+    </script>
+</body>
+
+</html>

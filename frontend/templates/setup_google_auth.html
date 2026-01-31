@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>NoteVault Google Authenticator Setup</title>
+    <link rel="stylesheet" href="/static/css/setup_google_auth.css">
+</head>
+
+<body>
+
+    <div class="setup-container">
+        <h2>Google Authenticator Setup</h2>
+
+        <div class="instructions">
+            <h3>Instructions:</h3>
+            <ol>
+                <li>Install Google Authenticator on your phone</li>
+                <li>Scan the QR code below with the app</li>
+                <li>Enter the 6-digit code from the app to complete setup (expires every 30 seconds)</li>
+            </ol>
+        </div>
+
+        <div class="qr-code">
+            <h3>Scan this QR Code:</h3>
+            <img src="data:image/png;base64,{{ qr_code }}" width="125" alt="QR Code">
+        </div>
+
+        <div class="secret-section">
+            <h3>Or enter this secret key manually:</h3>
+            <div class="secret-key"
+                style="background: #f4f4f4; padding: 10px; font-family: monospace; border-radius: 5px; margin-top: 5px;">
+                <strong>{{ secret }}</strong>
+            </div>
+        </div>
+
+        <form method="POST">
+            <input type="hidden" name="email" value="{{ email }}">
+            <input type="hidden" name="secret" value="{{ secret }}">
+
+            <div class="form-group">
+                <label>Enter Verification Code:</label>
+                <input type="text" name="token" maxlength="6" placeholder="000000" required autofocus>
+            </div>
+
+            <button type="submit">Complete Setup</button>
+
+            <a href="{{ url_for('dashboard') }}" class="cancel-link">
+                <button type="button" class="cancel">Cancel</button>
+            </a>
+        </form>
+    </div>
+
+</body>
+
+</html>

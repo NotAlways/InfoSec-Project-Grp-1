@@ -1,8 +1,8 @@
-const API_URL = "https://localhost:8000";
+const API_URL = "http://localhost:8000";
 let currentNoteId = null;
 
 // Load notes when page first loads
-document.addEventListener("DOMContentLoaded", function() {
+document.addEventListener("DOMContentLoaded", function () {
   console.log("Page loaded, initializing...");
   showSection("notes");
   loadNotes();
@@ -75,13 +75,13 @@ async function loadNotes() {
     console.log("Loading notes from " + API_URL + "/notes");
     const response = await fetch(`${API_URL}/notes`);
     console.log(`GET /notes response status: ${response.status}`);
-    
+
     if (!response.ok) {
       const error = await response.text();
       console.error(`Failed to load notes: ${response.status} - ${error}`);
       return;
     }
-    
+
     const notes = await response.json();
     console.log(`Loaded ${notes.length} notes`);
     const noteList = document.getElementById("noteList");
@@ -143,6 +143,14 @@ function clearNoteForm() {
 }
 
 function logout() {
-  alert("Logged out!");
-  // TODO: clear session token and redirect to login
+  const confirmed = confirm("Are you sure you want to log out of NoteVault?");
+
+  if (confirmed) {
+    // InfoSec: Clear storage to prevent session leakage on shared computers
+    localStorage.clear();
+    sessionStorage.clear();
+
+    // Redirect to the backend route to destroy the session cookie
+    window.location.href = "/logout";
+  }
 }
