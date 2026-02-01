@@ -51,7 +51,12 @@ from webauthn.helpers import bytes_to_base64url
 import os
 import base64
 from fastapi.responses import JSONResponse
+from urllib.parse import quote
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
+limiter = Limiter(key_func=get_remote_address)
 
 
 # --- IMPORTS FOR EMAIL ---
@@ -105,6 +110,13 @@ class NoteResponse(BaseModel):
 
 # FastAPI app
 app = FastAPI(title="NoteVault API")
+app.state.limiter = limiter
+@app.exception_handler(RateLimitExceeded)
+async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return redirect_with_error(
+        "/login",
+        "Too many requests. Please wait and try again"
+    )
 
 # CORS middleware
 app.add_middleware(
@@ -242,6 +254,10 @@ def ensure_str_challenge(challenge) -> str:
     if isinstance(challenge, bytes):
         return bytes_to_base64url(challenge)  # from webauthn.helpers
     return str(challenge)
+
+
+def redirect_with_error(path: str, msg: str) -> RedirectResponse:
+    return RedirectResponse(url=f"{path}?error={quote(msg)}", status_code=303)
 
 
 # --- WebAuthn / Passkeys (Platform Biometrics for Admins) ---
@@ -507,7 +523,9 @@ async def signup_start(
         })
 
     # 6. Success Flow: Handle PendingAction
-    action_data = {"username": username, "password": password}
+    
+    signup_nonce = str(uuid.uuid4())
+    action_data = {"username": username, "password": password, "signup_nonce": signup_nonce}
     pending = PendingAction(
         email=email,
         action_type="signup",
@@ -519,7 +537,7 @@ async def signup_start(
     await db.commit()
 
     # 7. Generate token and send email
-    token = EMAIL_SERIALIZER.dumps(email, salt=str(action_data))
+    token = EMAIL_SERIALIZER.dumps(email, salt=signup_nonce)
     verify_url = f"http://localhost:8000/verify-registration?token={token}"
     
     html_content = f"""
@@ -547,7 +565,11 @@ async def verify_registration(token: str, db: AsyncSession = Depends(get_db)):
 
         # 2. Verify the token using the action_data (username/password) as the salt
         # This binds the link to that specific signup attempt
-        EMAIL_SERIALIZER.loads(token, salt=str(pending.action_data), max_age=600)
+        signup_nonce = (pending.action_data or {}).get("signup_nonce")
+        if not signup_nonce:
+            raise Exception("Missing signup nonce (stale signup request)")
+        
+        EMAIL_SERIALIZER.loads(token, salt=signup_nonce, max_age=600)
         
         await db.execute(update(PendingAction).where(PendingAction.email == email).values(is_verified=True))
         await db.commit()
@@ -681,9 +703,16 @@ async def render_login(request: Request):
 
 @app.get("/login", response_class=HTMLResponse)
 async def render_login(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request})
+    error = request.query_params.get("error")
+    message = request.query_params.get("message")
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "error": error,
+        "message": message
+    })
 
 @app.post("/login")
+@limiter.limit("5/minute")
 async def login_process(
     request: Request,
     email: str = Form(...),
@@ -881,6 +910,7 @@ async def render_2fa_input(request: Request, email: str):
     return templates.TemplateResponse("google_auth_2fa.html", {"request": request, "email": email})
 
 @app.post("/verify-2fa")
+@limiter.limit("6/minute")
 async def verify_2fa(
     request: Request,
     token: str = Form(...),
@@ -960,7 +990,15 @@ async def verify_2fa(
     await db.commit()
 
     if user.status == "locked":
-        return RedirectResponse(url="/login", status_code=303)
+        # show timed lockout minutes for users
+        if user.lockout_until:
+            remaining = int((user.lockout_until - get_sg_time()).total_seconds() / 60)
+            remaining = remaining if remaining > 0 else 1
+            return redirect_with_error("/login", f"Too many attempts. Try again in {remaining} minutes")
+
+        # hard lock (admins/superadmin)
+        return redirect_with_error("/login", "Account locked due to multiple failed attempts. Contact support")
+
 
     return templates.TemplateResponse(
         "google_auth_2fa.html",
@@ -979,6 +1017,7 @@ async def render_backup_verify(request: Request, email: str):
     })
 
 @app.post("/verify-backup-pin")
+@limiter.limit("6/minute")
 async def verify_backup_pin(
     request: Request,
     pin: str = Form(...),
@@ -1057,7 +1096,11 @@ async def verify_backup_pin(
     await db.commit()
 
     if user.status == "locked":
-        return RedirectResponse(url="/login", status_code=303)
+        if user.lockout_until:
+            remaining = int((user.lockout_until - get_sg_time()).total_seconds() / 60)
+            remaining = remaining if remaining > 0 else 1
+            return redirect_with_error("/login", f"Too many attempts. Try again in {remaining} minutes")
+        return redirect_with_error("/login", "Account locked due to multiple failed attempts. Contact support")
 
     return templates.TemplateResponse(
         "backupcode_verify.html",
@@ -1399,6 +1442,7 @@ async def render_reset_request(request: Request):
     return templates.TemplateResponse("passwordreset_req.html", {"request": request})
 
 @app.post("/reset_password")
+@limiter.limit("3/hour")
 async def process_reset_request(request: Request, email: str = Form(...), db: AsyncSession = Depends(get_db)):
     # NEW: Always clear any old pending actions for this email (prevents cross-flow pollution)
     await db.execute(delete(PendingAction).where(PendingAction.email == email))

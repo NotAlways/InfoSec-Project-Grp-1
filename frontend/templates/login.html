@@ -13,44 +13,56 @@
         <h1>Login to NoteVault</h1>
 
         {% if request.query_params.get("message") %}
-        <div class="alert-box"
-            style="color: #155724; background-color: #d4edda; border: 1px solid #c3e6cb; padding: 15px; border-radius: 5px; margin-bottom: 20px; text-align: center; position: relative;">
+        <div class="alert-box" style="
+                color: #155724;
+                background-color: #d4edda;
+                border: 1px solid #c3e6cb;
+                padding: 15px 45px 15px 15px;
+                border-radius: 5px;
+                margin-bottom: 20px;
+                text-align: center;
+                position: relative;
+            ">
             {{ request.query_params.get("message") }}
-            <span onclick="this.parentElement.style.display='none'" style="position: absolute; 
-                top: 0; 
-                right: 0; 
-                height: 100%; 
-                width: 40px; 
-                display: flex; 
-                align-items: center; 
-                justify-content: center; 
-                cursor: pointer; 
-                font-size: 22px; 
-                font-weight: bold; 
-                color: inherit; 
-                opacity: 0.7;">
+            <span onclick="this.parentElement.style.display='none'" style="
+                position: absolute;
+                top: 50%;
+                right: 12px;
+                transform: translateY(-50%);
+                cursor: pointer;
+                font-size: 22px;
+                font-weight: bold;
+                color: inherit;
+                opacity: 0.7;
+            ">
                 &times;
             </span>
         </div>
         {% endif %}
 
         {% if error %}
-        <div class="alert-box"
-            style="color: #721c24; background-color: #f8d7da; border: 1px solid #f5c6cb; padding: 15px; border-radius: 5px; margin-bottom: 20px; text-align: center; position: relative;">
+        <div class="alert-box" style="
+                color: #721c24;
+                background-color: #f8d7da;
+                border: 1px solid #f5c6cb;
+                padding: 15px 45px 15px 15px;
+                border-radius: 5px;
+                margin-bottom: 20px;
+                text-align: center;
+                position: relative;
+            ">
             {{ error }}
-            <span onclick="this.parentElement.style.display='none'" style="position: absolute; 
-                top: 0; 
-                right: 0; 
-                height: 100%; 
-                width: 40px; 
-                display: flex; 
-                align-items: center; 
-                justify-content: center; 
-                cursor: pointer; 
-                font-size: 22px; 
-                font-weight: bold; 
-                color: inherit; 
-                opacity: 0.7;">
+            <span onclick="this.parentElement.style.display='none'" style="
+                position: absolute;
+                top: 50%;
+                right: 12px;
+                transform: translateY(-50%);
+                cursor: pointer;
+                font-size: 22px;
+                font-weight: bold;
+                color: inherit;
+                opacity: 0.7;
+            ">
                 &times;
             </span>
         </div>
