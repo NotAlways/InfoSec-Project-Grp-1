@@ -111,6 +111,10 @@ class NoteResponse(BaseModel):
 # FastAPI app
 app = FastAPI(title="NoteVault API")
 app.state.limiter = limiter
+
+def redirect_with_error(path: str, msg: str) -> RedirectResponse:
+    return RedirectResponse(url=f"{path}?error={quote(msg)}", status_code=303)
+
 @app.exception_handler(RateLimitExceeded)
 async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return redirect_with_error(
@@ -256,8 +260,15 @@ def ensure_str_challenge(challenge) -> str:
     return str(challenge)
 
 
-def redirect_with_error(path: str, msg: str) -> RedirectResponse:
-    return RedirectResponse(url=f"{path}?error={quote(msg)}", status_code=303)
+def set_trusted_device_cookie(response: RedirectResponse, user: "User"):
+    response.set_cookie(
+        key="device_token",
+        value=EMAIL_SERIALIZER.dumps(user.email, salt=user.device_key),
+        max_age=60 * 60 * 24 * 30,  # 30 days
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
 
 
 # --- WebAuthn / Passkeys (Platform Biometrics for Admins) ---
@@ -939,13 +950,16 @@ async def verify_2fa(
     pending_res = await db.execute(select(PendingAction).filter(PendingAction.email == email))
     pending = pending_res.scalar_one_or_none()
 
-    # For normal login, we REQUIRE a pending record and it must be verified (email step)
-    if pending and pending.action_type == "login":
-        if not pending.is_verified:
-            return templates.TemplateResponse(
-                "google_auth_2fa.html",
-                {"request": request, "email": email, "error": "Please verify the login link from your email first."}
-            )
+    # ✅ NEW: must have an active login and password_reset session
+    if not pending or pending.action_type not in ["login", "password_reset"]:
+        return redirect_with_error("/login", "Session expired. Please try again.")
+
+    # ✅ NEW: must complete email verification step (for new device)
+    if not pending.is_verified:
+        return templates.TemplateResponse(
+            "google_auth_2fa.html",
+            {"request": request, "email": email, "error": "Please verify the login link from your email first."}
+        )
 
     # 6. Verify TOTP
     if pyotp.TOTP(user.totp_secret).verify(token):
@@ -973,7 +987,7 @@ async def verify_2fa(
         else:
             redirect_url = "/home"
         response = RedirectResponse(url=redirect_url, status_code=303)
-
+        
         response.set_cookie(
             key="session_id",
             value=new_sid,
@@ -981,6 +995,8 @@ async def verify_2fa(
             samesite="lax",
             path="/"
         )
+        
+        set_trusted_device_cookie(response, user)
         response.delete_cookie("tmp_login", path="/")
         return response
 
@@ -1046,13 +1062,16 @@ async def verify_backup_pin(
     pending_res = await db.execute(select(PendingAction).filter(PendingAction.email == email))
     pending = pending_res.scalar_one_or_none()
 
-    # For normal login, REQUIRE pending login + verified
-    if pending and pending.action_type == "login":
-        if not pending.is_verified:
-            return templates.TemplateResponse(
-                "backupcode_verify.html",
-                {"request": request, "email": email, "error": "Please verify the login link from your email first."}
-            )
+    # ✅ NEW: must have an active login session
+    if not pending or pending.action_type not in ["login", "password_reset"]:
+        return redirect_with_error("/login", "Session expired. Please try again.")
+
+    # ✅ NEW: must complete email verification step (for new device)
+    if not pending.is_verified:
+        return templates.TemplateResponse(
+            "backupcode_verify.html",
+            {"request": request, "email": email, "error": "Please verify the login link from your email first."}
+        )
 
     # 6. Verify backup PIN
     if pwd_context.verify(pin, user.backup_pin_hash):
@@ -1079,7 +1098,7 @@ async def verify_backup_pin(
         else:
             redirect_url = "/home"
         response = RedirectResponse(url=redirect_url, status_code=303)
-
+        
         response.set_cookie(
             key="session_id",
             value=new_sid,
@@ -1087,6 +1106,7 @@ async def verify_backup_pin(
             samesite="lax",
             path="/"
         )
+        set_trusted_device_cookie(response, user)
         response.delete_cookie("tmp_login", path="/")
         return response
 
@@ -1574,7 +1594,7 @@ async def process_final_reset(request: Request, token: str = Form(...), password
         # 4. Prepare Response and clear the local session cookie
         response = RedirectResponse(url="/login?message=Password updated successfully", status_code=303)
         response.delete_cookie("session_id", path="/")
-        
+        response.delete_cookie("device_token", path="/")
         return response
         
     except Exception as e:
@@ -1640,4 +1660,5 @@ async def logout(request: Request, db: AsyncSession = Depends(get_db)):
         response = RedirectResponse(url="/login", status_code=303)
         response.delete_cookie("session_id", path="/")
         response.delete_cookie(ADMIN_PASSKEY_COOKIE, path="/")  # ✅ important
+        response.delete_cookie("device_token", path="/")
         return response
