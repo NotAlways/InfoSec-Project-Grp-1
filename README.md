@@ -1,2 +1,3 @@
 # InfoSec-Project-Grp-1
 # To run, u need to install postresql , run CREATE DATABASE notevault;, change the default password to your set password in main.py, then start the backend doing 'cd backend' then 'python -m uvicorn main:app --reload' or 'python -m uvicorn main:app --ssl-certfile cert.pem --ssl-keyfile key.pem' (if you have openssl) in terminal. Then navigate to index.html in your file explorer and open with browser. 
+# For key gen, cd backend then run python init_crypto.py
