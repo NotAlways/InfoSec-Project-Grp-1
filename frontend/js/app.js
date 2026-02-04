@@ -1,4 +1,4 @@
-const API_URL = "http://localhost:8000";
+const API_URL = "https://localhost:8000";
 let currentNoteId = null;
 
 // Load notes when page first loads

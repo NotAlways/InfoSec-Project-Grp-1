@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NoteVault - Change Recovery PIN</title>
+    <link rel="stylesheet" href="/static/css/change_backup_pin.css">
+</head>
+
+<body>
+    <div class="pin-container">
+        <h1>Change Recovery PIN</h1>
+        <p>
+            For security reasons, please update your 6-digit Recovery PIN.
+            This PIN is used only if you lose access to your authenticator
+        </p>
+
+        {% if error %}
+        <div id="errorAlert" class="error-box">
+            <span class="close-btn" onclick="closeError()">&times;</span>
+
+            <strong>Please fix the following:</strong>
+            <ul>
+                {% for err in error.split(' | ') %}
+                <li>{{ err }}</li>
+                {% endfor %}
+            </ul>
+        </div>
+
+        <script>
+            function closeError() {
+                document.getElementById('errorAlert').style.display = 'none';
+            }
+        </script>
+        {% endif %}
+
+        <form method="POST" action="/change-backup-pin">
+            <label for="current_pin">Current Recovery PIN:</label>
+            <input type="password" id="current_pin" name="current_pin" maxlength="6" pattern="\d{6}"
+                placeholder="••••••" required>
+
+            <label for="new_pin">New Recovery PIN:</label>
+            <input type="password" id="new_pin" name="new_pin" maxlength="6" pattern="\d{6}" placeholder="••••••"
+                required>
+
+            <label for="confirm_pin">Confirm New Recovery PIN:</label>
+            <input type="password" id="confirm_pin" name="confirm_pin" maxlength="6" pattern="\d{6}"
+                placeholder="••••••" required>
+
+            <button type="submit">Update PIN</button>
+        </form>
+
+        <a href="/home" class="back-link">Back to Home Page</a>
+
+        <p class="note">
+            <strong>Note:</strong> The Recovery PIN must be exactly 6 digits and cannot
+            match your current or recently used PINs
+        </p>
+    </div>
+</body>
+
+</html>

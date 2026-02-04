@@ -18,7 +18,22 @@
       {% if user.role in ['admin', 'superadmin'] %}
       <li><a href="/admin" style="color: #f1c40f; font-weight: bold;">Admin Panel</a></li>
       {% endif %}
-      <li><a href="javascript:void(0)" onclick="logout()">Logout</a></li>
+      <!-- ✅ NEW: Profile avatar + dropdown -->
+      <li class="profile-menu">
+        <button class="avatar-btn" type="button" onclick="toggleProfileMenu(event)">
+          <span class="avatar-initials">{{ user.username[:1]|upper }}</span>
+        </button>
+
+        <div id="profileDropdown" class="profile-dropdown">
+          <div class="profile-meta">
+            <div class="profile-name">{{ user.username }}</div>
+            <div class="profile-email">{{ user.email }}</div>
+          </div>
+          <a href="/change-backup-pin">Change PIN</a>
+          <a href="javascript:void(0)" onclick="logout()">Logout</a>
+        </div>
+      </li>
+      <!-- ✅ END NEW -->
     </ul>
   </nav>
 
@@ -35,9 +50,9 @@
   <script>
     // Logic to check if the message has been dismissed
     (function () {
-      const msg = "{{ message }}";
-      // We use a simple key based on the message content
-      const storageKey = "dismissed_" + btoa(msg).substring(0, 16);
+      const msg = "{{ message or '' }}";
+      const safeMsg = (msg && msg !== "None") ? msg : "";
+      const storageKey = "dismissed_" + btoa(unescape(encodeURIComponent(safeMsg))).substring(0, 16);
 
       if (!sessionStorage.getItem(storageKey)) {
         document.getElementById('statusAlert').style.display = 'flex';
@@ -75,6 +90,23 @@
     <h2>Security Dashboard</h2>
     <p>Recent logins, activity, alerts will appear here.</p>
   </div>
+
+  <!-- ✅ NEW: dropdown JS (place BEFORE app.js include) -->
+  <script>
+    function toggleProfileMenu(e) {
+      e.stopPropagation();
+      const dd = document.getElementById("profileDropdown");
+      if (!dd) return;
+      dd.style.display = (dd.style.display === "block") ? "none" : "block";
+    }
+
+    document.addEventListener("click", function () {
+      const dd = document.getElementById("profileDropdown");
+      if (!dd) return;
+      dd.style.display = "none";
+    });
+  </script>
+  <!-- ✅ END NEW -->
 
   <!-- Link JS -->
   <script src="/static/js/app.js?v=1.2"></script>

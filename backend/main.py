@@ -250,6 +250,48 @@ def get_sg_time():
     return sg_time.replace(tzinfo=None)
 
 
+BACKUP_PIN_MAX_AGE_DAYS = 180
+
+def is_backup_pin_expired(user: "User") -> bool:
+    if not user.backup_pin_changed_at:
+        return True
+    return (get_sg_time() - user.backup_pin_changed_at) > timedelta(days=BACKUP_PIN_MAX_AGE_DAYS)
+
+
+def get_backup_pin_history_limit(user: "User") -> int:
+    # Policy: users last 3, admins/superadmin last 5
+    return 5 if user.role in ["admin", "superadmin"] else 3
+
+def backup_pin_reused(user: "User", new_pin: str) -> bool:
+    # Blocks reuse of current pin + last N pin hashes
+    try:
+        if user.backup_pin_hash and pwd_context.verify(new_pin, user.backup_pin_hash):
+            return True
+    except Exception:
+        return True
+
+    history = user.backup_pin_history or []
+    limit = get_backup_pin_history_limit(user)
+    for old_hash in history[-limit:]:
+        try:
+            if pwd_context.verify(new_pin, old_hash):
+                return True
+        except Exception:
+            # If an old hash is malformed, be safe and treat as reused
+            return True
+    return False
+
+def push_backup_pin_history(user: "User"):
+    # Store the previous pin hash, keep only last N
+    if not user.backup_pin_hash:
+        return
+    history = user.backup_pin_history or []
+    history.append(user.backup_pin_hash)
+
+    limit = get_backup_pin_history_limit(user)
+    user.backup_pin_history = history[-limit:]
+
+
 def ensure_str_challenge(challenge) -> str:
     """
     webauthn may give challenge as bytes or str depending on version.
@@ -274,7 +316,7 @@ def set_trusted_device_cookie(response: RedirectResponse, user: "User"):
 # --- WebAuthn / Passkeys (Platform Biometrics for Admins) ---
 WEBAUTHN_RP_ID = "localhost"                 # must match your domain
 WEBAUTHN_RP_NAME = "NoteVault"
-WEBAUTHN_ORIGIN = "http://localhost:8000"    # MUST match your browser URL exactly
+WEBAUTHN_ORIGIN = "https://localhost:8000"    # MUST match your browser URL exactly
 PASSKEY_TTL_SECONDS = 120
 
 
@@ -323,6 +365,9 @@ class User(Base):
     password_history = Column(JSON, default=list)
     totp_secret = Column(String)
     backup_pin_hash = Column(String)
+    backup_pin_history = Column(JSON, default=list)
+    backup_pin_changed_at = Column(DateTime, default=get_sg_time)
+    must_change_backup_pin = Column(Boolean, default=False)
     role = Column(String, default="user")
     status = Column(String, default="active")
     failed_login_attempts = Column(Integer, default=0)
@@ -363,20 +408,44 @@ async def verify_session(request: Request, db: AsyncSession = Depends(get_db)):
     if not session_id:
         raise HTTPException(status_code=303)
 
-    # Verify ID exists in DB
-    res = await db.execute(select(User).filter(User.current_session_id == session_id))
+    res = await db.execute(select(User).where(User.current_session_id == session_id))
     user = res.scalar_one_or_none()
-    
     if not user:
         raise HTTPException(status_code=303)
-    
+
+    # ✅ GLOBAL PIN GATE (blocks everything except allowed pages)
+    pin_expired = is_backup_pin_expired(user) or bool(getattr(user, "must_change_backup_pin", False))
+    path = request.url.path
+
+    allowed_paths = {
+        "/change-backup-pin",
+        "/logout",
+        "/login",
+        "/",
+    }
+
+    # allow static files + auth endpoints needed for completing login
+    if path.startswith("/static") or path.startswith("/auth/") or path.startswith("/verify-"):
+        return user
+
+    if pin_expired and path not in allowed_paths:
+        # special signal to redirect to change pin
+        raise HTTPException(status_code=409, detail="PIN_EXPIRED")
+
     return user
+
 
 @app.exception_handler(HTTPException)
 async def auth_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code == 303:
-        return RedirectResponse(url="/login")
+        return RedirectResponse(url="/login", status_code=303)
+
+    # ✅ If PIN expired, force /change-backup-pin
+    if exc.status_code == 409 and exc.detail == "PIN_EXPIRED":
+        return RedirectResponse(url="/change-backup-pin", status_code=303)
+
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
 
 def apply_lockout_policy(user: User):
     """
@@ -549,7 +618,7 @@ async def signup_start(
 
     # 7. Generate token and send email
     token = EMAIL_SERIALIZER.dumps(email, salt=signup_nonce)
-    verify_url = f"http://localhost:8000/verify-registration?token={token}"
+    verify_url = f"https://localhost:8000/verify-registration?token={token}"
     
     html_content = f"""
     <h3>Welcome to {APP_NAME}</h3>
@@ -683,7 +752,10 @@ async def finalize_signup(
         username=pending.action_data['username'],
         email=email, 
         hashed_password=pwd_context.hash(pending.action_data['password']), 
-        backup_pin_hash=pwd_context.hash(backup_pin), 
+        backup_pin_hash=pwd_context.hash(backup_pin),
+        backup_pin_history=[],
+        backup_pin_changed_at=get_sg_time(),
+        must_change_backup_pin=False,
         totp_secret=secret,
         role="user",
         status="active",
@@ -827,7 +899,7 @@ async def login_process(
         await db.commit()
 
         token = EMAIL_SERIALIZER.dumps(email, salt=pending_session_id)
-        verify_url = f"http://localhost:8000/verify-login?token={token}"
+        verify_url = f"https://localhost:8000/verify-login?token={token}"
         html_body = (
             f"<h2>New Device Login</h2>"
             f"<p>We detected a login from a new device. If this is you, authorize this session:</p>"
@@ -901,7 +973,7 @@ async def verify_login_link(token: str, db: AsyncSession = Depends(get_db)):
         return HTMLResponse("""
         <html><body style="font-family:Arial; text-align:center; padding:50px;">
             <h1 style="color:#5cb85c;">Login Verified!</h1>
-            <p>You may close this tab and return to your login window.</p>
+            <p>You may close this tab and return to your login window</p>
         </body></html>
         """)
 
@@ -910,7 +982,7 @@ async def verify_login_link(token: str, db: AsyncSession = Depends(get_db)):
         return HTMLResponse("""
         <html><body style="font-family:Arial; text-align:center; padding:50px;">
             <h1 style="color:#d9534f;">Link Expired or Invalid</h1>
-            <p>A newer login link may have been requested, or the link has expired.</p>
+            <p>A newer login link may have been requested, or the link has expired</p>
         </body></html>
         """)
 
@@ -977,6 +1049,18 @@ async def verify_2fa(
         # FINAL LOGIN SUCCESS: create REAL session now
         new_sid = str(uuid.uuid4())
         user.current_session_id = new_sid
+
+        pin_expired = is_backup_pin_expired(user) or bool(getattr(user, "must_change_backup_pin", False))
+        if pin_expired:
+            # Cleanup first
+            await db.execute(delete(PendingAction).where(PendingAction.email == email))
+            await db.commit()
+
+            response = RedirectResponse(url="/change-backup-pin", status_code=303)
+            response.set_cookie("session_id", new_sid, httponly=True, samesite="lax", path="/")
+            set_trusted_device_cookie(response, user)
+            response.delete_cookie("tmp_login", path="/")
+            return response
 
         # Cleanup
         await db.execute(delete(PendingAction).where(PendingAction.email == email))
@@ -1089,6 +1173,18 @@ async def verify_backup_pin(
         # FINAL LOGIN SUCCESS
         new_sid = str(uuid.uuid4())
         user.current_session_id = new_sid
+        
+        pin_expired = is_backup_pin_expired(user) or bool(getattr(user, "must_change_backup_pin", False))
+        if pin_expired:
+            # Cleanup first
+            await db.execute(delete(PendingAction).where(PendingAction.email == email))
+            await db.commit()
+
+            response = RedirectResponse(url="/change-backup-pin", status_code=303)
+            response.set_cookie("session_id", new_sid, httponly=True, samesite="lax", path="/")
+            set_trusted_device_cookie(response, user)
+            response.delete_cookie("tmp_login", path="/")
+            return response
 
         await db.execute(delete(PendingAction).where(PendingAction.email == email))
         await db.commit()
@@ -1126,6 +1222,54 @@ async def verify_backup_pin(
         "backupcode_verify.html",
         {"request": request, "email": email, "error": "Incorrect Recovery PIN"}
     )
+
+
+@app.get("/change-backup-pin", response_class=HTMLResponse)
+async def change_backup_pin_page(request: Request, user: User = Depends(verify_session)):
+    return templates.TemplateResponse("change_backup_pin.html", {"request": request, "user": user})
+
+
+@app.post("/change-backup-pin")
+@limiter.limit("6/minute")
+async def change_backup_pin_submit(
+    request: Request,
+    current_pin: str = Form(...),
+    new_pin: str = Form(...),
+    confirm_pin: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(verify_session),
+):
+    errors = []
+
+    if not pwd_context.verify(current_pin, user.backup_pin_hash):
+        errors.append("Current PIN is incorrect")
+
+    if new_pin != confirm_pin:
+        errors.append("PINs do not match")
+
+    if new_pin in WEAK_PINS:
+        errors.append("This PIN is too weak. Please choose a more secure 6-digit PIN")
+
+    if not re.fullmatch(r"\d{6}", new_pin):
+        errors.append("PIN must be exactly 6 digits")
+
+    if backup_pin_reused(user, new_pin):
+        n = get_backup_pin_history_limit(user)
+        errors.append(f"New PIN cannot match your current PIN or your last {n} PINs")
+
+    if errors:
+        return templates.TemplateResponse("change_backup_pin.html", {
+            "request": request, "user": user, "error": " | ".join(errors)
+        })
+
+    push_backup_pin_history(user)  # NEW: store old hash into history first
+    user.backup_pin_hash = pwd_context.hash(new_pin)
+    user.backup_pin_changed_at = get_sg_time()
+    user.must_change_backup_pin = False
+
+    await db.commit()
+    return RedirectResponse(url="/home?message=Recovery PIN updated successfully", status_code=303)
+
 
 # --- ADMIN ---
 
@@ -1490,7 +1634,7 @@ async def process_reset_request(request: Request, email: str = Form(...), db: As
         # This makes it impossible to use old links if a new one is requested
         token = EMAIL_SERIALIZER.dumps(email, salt=f"{user.hashed_password}{handshake_id}")
         
-        verify_url = f"http://localhost:8000/verify-reset?token={token}"
+        verify_url = f"https://localhost:8000/verify-reset?token={token}"
         
         html_content = f'<h2>Password Reset</h2><p>You have requested a password reset. Please authorize this request to proceed to 2FA:</p><a href="{verify_url}" style="background:#2c3e50; color:white; padding:10px 20px; text-decoration:none; border-radius:5px;">Verify Identity</a>'
         send_security_email("Password Reset Verification", email, html_content)
@@ -1614,6 +1758,9 @@ async def create_initial_admins():
                 hashed_password=pwd_context.hash("Someonewithnoname12345*****"),
                 password_history=[],
                 backup_pin_hash=pwd_context.hash("362926"),
+                backup_pin_history=[],
+                backup_pin_changed_at=get_sg_time(),
+                must_change_backup_pin=False,
                 totp_secret=pyotp.random_base32(),
                 role="superadmin",
                 status="active",
@@ -1633,6 +1780,9 @@ async def create_initial_admins():
                 hashed_password=pwd_context.hash("Someonewithnoname12345*****"),
                 password_history=[],
                 backup_pin_hash=pwd_context.hash("372826"),
+                backup_pin_history=[],
+                backup_pin_changed_at=get_sg_time(),
+                must_change_backup_pin=False,
                 totp_secret="MFRGGZDFMZTWQ2LK", # Fixed key so you can set up Google Auth once
                 role="admin", 
                 status="active",
