@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NoteVault 2FA Email Verification</title>
+    <link rel="stylesheet" href="/static/css/2fa_email_code.css">
+</head>
+
+<body>
+    <div class="container">
+        <h2>NoteVault Email Verification</h2>
+        <form action="/verify-code" method="POST">
+            <label>Please check your email inbox for further instructions</label>
+        </form>
+    </div>
+    <script>
+        const email = "{{ email }}";
+
+        async function checkStatus() {
+            try {
+                const response = await fetch(`/auth/poll-status/${encodeURIComponent(email)}`);
+                const data = await response.json();
+
+                if (!data.verified) return;
+
+                // Only redirect for known action types
+                if (data.action === "signup") {
+                    window.location.href = `/setup-google-auth?email=${encodeURIComponent(email)}`;
+                    return;
+                }
+
+                if (data.action === "login" || data.action === "password_reset") {
+                    window.location.href = `/google-auth-2fa?email=${encodeURIComponent(email)}`;
+                    return;
+                }
+
+                // Unknown action -> do nothing (prevents weird jumps)
+                console.warn("Unexpected poll action:", data.action);
+
+            } catch (e) {
+                console.error("Polling error", e);
+            }
+        }
+
+        setInterval(checkStatus, 2000);
+    </script>
+
+</body>
+
+</html>

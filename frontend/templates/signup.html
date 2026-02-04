@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NoteVault Signup</title>
+    <link rel="stylesheet" href="/static/css/signup.css">
+</head>
+
+<body>
+    <div class="container">
+        <h1>Signup</h1>
+
+        {% if error %}
+        <div id="error-box"
+            style="position: relative; color: #721c24; background-color: #f8d7da; border: 1px solid #f5c6cb; padding: 15px 40px 15px 15px; border-radius: 5px; margin-bottom: 20px; text-align: left; font-size: 0.95em; line-height: 1.5;">
+            <strong style="display: block; margin-bottom: 10px;">Please fix the following:</strong>
+            <ul style="margin: 0; padding-left: 20px;">
+                {% for part in error.split(' | ') %}
+                {# Each bullet point gets a bottom margin to act as a blank line #}
+                <li style="margin-bottom: 12px;">{{ part }}</li>
+                {% endfor %}
+            </ul>
+            <span onclick="closeError()"
+                style="position: absolute; right: 12px; top: 15px; cursor: pointer; font-weight: bold; font-size: 22px; line-height: 1;">&times;</span>
+        </div>
+        {% endif %}
+
+        <script>
+            function closeError() {
+                const errorBox = document.getElementById('error-box');
+                if (errorBox) {
+                    errorBox.style.display = 'none';
+                }
+            }
+        </script>
+
+        <form action="/register" method="POST">
+            <div class="form-group">
+                <label for="username">Username:</label>
+                <input type="text" id="username" name="username" value="{{ username if username else '' }}" required>
+            </div>
+            <div class="form-group">
+                <label for="email">Email:</label>
+                <input type="email" id="email" name="email" value="{{ email if email else '' }}" required>
+            </div>
+            <div class="form-group">
+                <label for="password">Password:</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            <div class="form-group">
+                <label for="confirm_password">Confirm Password:</label>
+                <input type="password" id="confirm_password" name="confirm_password" required>
+            </div>
+            <div class="form-group">
+                <button type="submit">Signup</button>
+            </div>
+        </form>
+
+        <p id="login">Already have an account? <a href="/login" id="login_link">Login here</a></p>
+        <p id="reset">Forgot your password? <a href="/reset-password" id="login_link">Reset here</a></p>
+
+        <p id="requirement">
+            <strong>Note:</strong> Password must be at least 14 characters long and include at least one
+            uppercase letter, one lowercase letter, one number, and one special character
+        </p>
+    </div>
+</body>
+
+</html>

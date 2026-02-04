@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>NoteVault User Verification</title>
+    <link rel="stylesheet" href="/static/css/google_auth.css">
+</head>
+
+<body>
+    <div class="container">
+        <h2>Enter Google Authenticator Code</h2>
+        <p id="message">Please enter the 6-digit code from your Google Authenticator app</p>
+        {% if error %}
+        <div
+            style="color: #721c24; background-color: #f8d7da; border: 1px solid #f5c6cb; padding: 10px; border-radius: 5px; margin-bottom: 20px; text-align: center;">
+            {{ error }}
+        </div>
+        {% endif %}
+        <form action="/verify-2fa" method="POST">
+
+            <input type="hidden" name="email" value="{{ email }}">
+
+            <div class="form-group">
+                <label>Code:</label>
+                <input type="text" name="token" maxlength="6" placeholder="000000" required autofocus>
+            </div>
+            <button type="submit">Verify</button>
+        </form>
+
+        <p id="alt_verify">Lost access to your Google Authenticator/phone? Verify using your
+            <a href="/backup?email={{ email }}" id="recovery">Recovery PIN</a>
+        </p>
+    </div>
+</body>
+
+</html>

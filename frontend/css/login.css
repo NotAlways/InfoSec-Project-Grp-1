@@ -1,0 +1,95 @@
+body {
+    font-family: Arial, sans-serif;
+    background-color: #f4f4f4;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    margin: 0;
+}
+
+.login-container {
+    background: white;
+    margin: 50px;
+    padding: 50px;
+    border-radius: 5px;
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+}
+
+h1 {
+    margin-bottom: 30px;
+}
+
+label {
+    display: block;
+    margin-bottom: 5px;
+}
+
+input {
+    width: 92.5%;
+    padding: 10px;
+    margin-bottom: 30px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+}
+
+button {
+    width: 100%;
+    margin-bottom: 5px;
+    margin-top: 4px;
+    margin-left: 2.5px;
+    padding: 10px;
+    background-color: #5cb85c;
+    border: none;
+    border-radius: 4px;
+    color: white;
+    font-size: 16px;
+    cursor: pointer;
+}
+
+button:hover {
+    background-color: #4cae4c;
+}
+
+p {
+    margin-top: 15px;
+}
+
+#signup {
+    position: center;
+    margin-left: 5px;
+}
+
+#reset {
+    position: center;
+    margin-left: 15px;
+}
+
+#register {
+    text-decoration: none;
+    color: #5cb85c;
+}
+
+.close-btn {
+    position: absolute;
+    top: 50%;
+    /* Move down halfway */
+    right: 10px;
+    /* Distance from right edge */
+    transform: translateY(-50%);
+    /* Pull back up by half its own height to center perfectly */
+    cursor: pointer;
+    font-size: 22px;
+    font-weight: bold;
+    line-height: 1;
+    padding: 5px;
+    /* Makes the clickable area bigger */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity 0.2s;
+}
+
+.close-btn:hover {
+    opacity: 0.6;
+}

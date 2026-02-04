@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>NoteVault - Set Backup PIN</title>
+    <link rel="stylesheet" href="/static/css/backup_code.css">
+</head>
+
+<body>
+    <div class="pin-container">
+        <h1>Set Recovery PIN</h1>
+        {% if error %}
+        <div id="error-box"
+            style="position: relative; color: #721c24; background-color: #f8d7da; border: 1px solid #f5c6cb; padding: 15px 40px 15px 15px; border-radius: 5px; margin-bottom: 20px; text-align: left; font-size: 0.95em; line-height: 1.5;">
+            <strong style="display: block; margin-bottom: 10px;">Security Alert:</strong>
+            <ul style="margin: 0; padding-left: 20px;">
+                {% for part in error.split(' | ') %}
+                <li style="margin-bottom: 12px;">{{ part }}</li>
+                {% endfor %}
+            </ul>
+            <span onclick="closeError()"
+                style="position: absolute; right: 12px; top: 15px; cursor: pointer; font-weight: bold; font-size: 22px; line-height: 1;">&times;</span>
+        </div>
+
+        <script>
+            function closeError() {
+                const errorBox = document.getElementById('error-box');
+                if (errorBox) { errorBox.style.display = 'none'; }
+            }
+        </script>
+        {% endif %}
+        <form action="/setup-backup-pin" method="POST">
+
+            <input type="hidden" name="email" value="{{ email }}">
+            <input type="hidden" name="secret" value="{{ secret }}">
+
+            <label>Create 6-Digit PIN:</label>
+            <input type="password" name="backup_pin" maxlength="6" pattern="\d{6}" placeholder="******" required
+                autofocus>
+
+            <label>Confirm PIN:</label>
+            <input type="password" name="confirm_pin" maxlength="6" pattern="\d{6}" placeholder="******" required>
+
+            <button type="submit">Save Recovery PIN</button>
+
+            <p style="margin-top: 20px; font-size: 0.9em; color: #666;">
+                <strong>Note: </strong>You will need this to access your account if you lose your phone or
+                the Google Authenticator app
+            </p>
+        </form>
+    </div>
+</body>
+
+</html>

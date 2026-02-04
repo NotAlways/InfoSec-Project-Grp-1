@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="/static/css/backupcode_verify.css">
+    <title>NoteVault - Backup PIN Verification</title>
+</head>
+
+<body>
+    <div class="pin-container">
+        <h1>Recovery PIN</h1>
+        <p>Enter the 6-digit Recovery PIN you created during setup to access your account</p>
+
+        {% if error %}
+        <div id="error-box"
+            style="position: relative; color: #721c24; background-color: #f8d7da; border: 1px solid #f5c6cb; padding: 12px 30px 12px 12px; border-radius: 5px; margin-bottom: 20px; text-align: center; font-size: 0.9em;">
+            {{ error }}
+            <span onclick="closeError()"
+                style="position: absolute; right: 10px; top: 50%; transform: translateY(-50%); cursor: pointer; font-weight: bold; font-size: 16px;">&times;</span>
+        </div>
+        {% endif %}
+
+        <form action="/verify-backup-pin" method="POST">
+            <input type="hidden" name="email" value="{{ email }}">
+
+            <div class="form-group">
+                <label for="pin">6-Digit PIN:</label>
+                <input type="password" id="pin" name="pin" maxlength="6" pattern="\d{6}" placeholder="••••••" required
+                    autofocus>
+            </div>
+
+            <button type="submit">Verify & Login</button>
+        </form>
+
+        <a href="/login" class="back-link">Return to Login</a>
+    </div>
+
+    <script>
+        function closeError() {
+            const errorBox = document.getElementById('error-box');
+            if (errorBox) {
+                errorBox.style.display = 'none';
+            }
+        }
+    </script>
+</body>
+
+</html>
