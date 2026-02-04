@@ -232,7 +232,6 @@ async def delete_note(note_id: int):
         return {"message": "Note deleted"}
 
 
-
 # --- from here onwards Prathip's code ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 EMAIL_SERIALIZER = URLSafeTimedSerializer("EMAIL_TOKEN_SECRET_KEY")
@@ -472,6 +471,38 @@ def apply_lockout_policy(user: User):
 async def startup_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+@app.get("/notes/{note_id}/copy-text")
+async def get_copy_text(
+    note_id: int,
+    request: Request,
+    user: User = Depends(verify_session),
+):
+    key = get_encryption_key()
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(Note).where(Note.id == note_id))
+        note = result.scalar_one_or_none()
+        if not note:
+            raise HTTPException(status_code=404, detail="Note not found")
+
+        # decrypt
+        content = decrypt_content(note.content, key) if note.content else ""
+
+        # stamp
+        stamp_time = get_sg_time().strftime("%Y-%m-%d %H:%M:%S (SGT)")
+        stamped = (
+            f"{note.title}\n\n{content}\n\n"
+            f"— Copied from NoteVault by {user.email} on {stamp_time} • note_id={note_id}"
+        )
+
+    # Optional audit trail (recommended)
+    print(
+        f"AUDIT_COPY note_id={note_id} user={user.email} ip={request.client.host} "
+        f"ua={request.headers.get('user-agent','')}"
+    )
+
+    return {"text": stamped}
 
 # Dashboard
 @app.get("/home", name="dashboard", response_class=HTMLResponse)

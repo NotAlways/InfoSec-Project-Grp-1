@@ -8,6 +8,40 @@ document.addEventListener("DOMContentLoaded", function () {
   loadNotes();
 });
 
+/* ✅ NEW: Ctrl+C Copy Stamping (best-effort)
+   - Works ONLY when user copies text inside the NoteVault page.
+   - Does NOT work if they copy outside the page, screenshot, etc.
+*/
+document.addEventListener("copy", (e) => {
+  try {
+    const notesSection = document.getElementById("notes");
+    if (!notesSection) return;
+
+    // Only stamp when Notes section is active/visible
+    const isHidden = (notesSection.style.display === "none");
+    if (isHidden) return;
+
+    const sel = window.getSelection();
+    const selectedText = sel ? sel.toString() : "";
+    if (!selectedText || !selectedText.trim()) return;
+
+    const user = window.NV_USER || {};
+    const email = user.email || "unknown";
+    const username = user.username || "unknown";
+    const ts = new Date().toLocaleString();
+
+    const stamped =
+      `${selectedText}\n\n— Copied from NoteVault by ${email} (${username}) on ${ts}`;
+
+    // Override clipboard content
+    e.clipboardData.setData("text/plain", stamped);
+    e.preventDefault();
+  } catch (err) {
+    // If anything fails, allow normal copy (no stamping)
+  }
+});
+// ✅ END NEW
+
 function showSection(sectionId) {
   const sections = document.querySelectorAll(".section");
   sections.forEach(sec => sec.style.display = "none");
@@ -95,6 +129,7 @@ async function loadNotes() {
         <p>${note.content}</p>
         <button onclick="editNote(${note.id})">Edit</button>
         <button onclick="deleteNote(${note.id})">Delete</button>
+        <button onclick="copyNote(${note.id})">Copy</button>
       `;
       noteList.appendChild(noteItem);
     });
@@ -152,5 +187,30 @@ function logout() {
 
     // Redirect to the backend route to destroy the session cookie
     window.location.href = "/logout";
+  }
+}
+
+async function copyNote(noteId) {
+  try {
+    const res = await fetch(`${API_URL}/notes/${noteId}/copy-text`, {
+      method: "GET",
+      credentials: "include" // IMPORTANT: send session cookie
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      console.error("Copy-text failed:", res.status, err);
+      alert("Failed to copy. Please login again");
+      return;
+    }
+
+    const data = await res.json();
+    const text = data.text || "";
+
+    await navigator.clipboard.writeText(text);
+    alert("Copied!");
+  } catch (e) {
+    console.error("Copy error:", e);
+    alert("Copy failed. Please try again");
   }
 }

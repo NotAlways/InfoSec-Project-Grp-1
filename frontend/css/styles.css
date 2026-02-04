@@ -170,3 +170,31 @@ button:hover {
 .note-item p {
   margin: 10px 0;
 }
+
+/* ✅ Watermark overlay (visible above note background, safe for UX) */
+.watermark {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  /* never blocks clicks */
+  z-index: 1;
+  /* ABOVE backgrounds, BELOW content */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.watermark-text {
+  opacity: 0.06;
+  font-size: 48px;
+  font-weight: 700;
+  color: #000;
+  transform: rotate(-25deg);
+  user-select: none;
+  white-space: nowrap;
+}
+
+/* ✅ END Watermark */
