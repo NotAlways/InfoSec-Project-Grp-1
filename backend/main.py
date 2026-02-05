@@ -18,7 +18,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from passlib.context import CryptContext
 from itsdangerous import URLSafeTimedSerializer
-from crypto import load_key, encrypt_content, decrypt_content
+from crypto import load_key, encrypt_content, decrypt_content, generate_key, wrap_key, unwrap_key
+from activity import log_activity
+from anomaly import check_anomaly
 from fastapi import Cookie
 from typing import Optional
 import asyncio
@@ -73,7 +75,7 @@ APP_NAME = "NoteVault"
 
 # Database setup, change to your own password here. Make sure PostgreSQL is running. To be encrypted in the future.
 # password: 1m1f1b1m
-DATABASE_URL = "postgresql+asyncpg://postgres:1m1f1b1m@localhost/notevault"
+DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/notevault"
 Base = declarative_base()
 
 # Load encryption key on startup
@@ -91,6 +93,7 @@ class Note(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, index=True)
     content = Column(String)
+    wrapped_key = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -166,12 +169,47 @@ def send_security_email(subject: str, recipient: str, body_html: str):
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        
+        # Migration: Add wrapped_key column if it doesn't exist
+        try:
+            from sqlalchemy import text
+            await conn.execute(text("""
+                ALTER TABLE notes 
+                ADD COLUMN IF NOT EXISTS wrapped_key VARCHAR
+            """))
+            print("✓ Migration: Added wrapped_key column to notes table")
+        except Exception as e:
+            print(f"Migration note: wrapped_key column may already exist or migration skipped: {e}")
+
+    # Ensure user_activity table exists for activity logging
+    try:
+        from activity import init_migration
+        await init_migration(engine)
+        print("✓ Migration: user_activity table ready")
+    except Exception as e:
+        print(f"Migration note: user_activity table migration skipped: {e}")
+
+    # Load anomaly detection model if available
+    try:
+        from anomaly import load_model
+        model = load_model()
+        app.state.anomaly_model = model
+        if model:
+            print("✓ Anomaly model loaded")
+        else:
+            print("! Anomaly model not found; create and save one using backend/anomaly.py")
+    except Exception as e:
+        print(f"Anomaly model load skipped: {e}")
 
 @app.post("/notes", response_model=NoteResponse)
 async def create_note(note: NoteSchema, db: AsyncSession = Depends(get_db)):
-    key = get_encryption_key()
-    encrypted_content = encrypt_content(note.content, key)
-    new_note = Note(title=note.title, content=encrypted_content)
+    master_key = get_encryption_key()
+    # generate a per-note DEK and encrypt the note with it
+    dek = generate_key()
+    encrypted_content = encrypt_content(note.content, dek)
+    # wrap the DEK with the master key
+    wrapped = wrap_key(dek, master_key)
+    new_note = Note(title=note.title, content=encrypted_content, wrapped_key=wrapped)
     db.add(new_note)
     await db.commit()
     await db.refresh(new_note)
@@ -180,43 +218,66 @@ async def create_note(note: NoteSchema, db: AsyncSession = Depends(get_db)):
 @app.get("/notes", response_model=list[NoteResponse])
 async def get_notes():
     from sqlalchemy import select
-    key = get_encryption_key()
+    master_key = get_encryption_key()
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Note))
         notes = result.scalars().all()
         # Decrypt content for each note
         for note in notes:
-            note.content = decrypt_content(note.content, key)
+            try:
+                if note.wrapped_key:
+                    dek = unwrap_key(note.wrapped_key, master_key)
+                    note.content = decrypt_content(note.content, dek)
+                else:
+                    # legacy/plaintext
+                    note.content = decrypt_content(note.content, master_key)
+            except Exception:
+                # if decryption fails, leave content as-is or set an error placeholder
+                note.content = "[unable to decrypt]"
         return notes
 
 @app.get("/notes/{note_id}", response_model=NoteResponse)
 async def get_note(note_id: int):
     from sqlalchemy import select
-    key = get_encryption_key()
+    master_key = get_encryption_key()
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Note).filter(Note.id == note_id))
         note = result.scalar_one_or_none()
         if not note:
             raise HTTPException(status_code=404, detail="Note not found")
-        note.content = decrypt_content(note.content, key)
+        try:
+            if note.wrapped_key:
+                dek = unwrap_key(note.wrapped_key, master_key)
+                note.content = decrypt_content(note.content, dek)
+            else:
+                note.content = decrypt_content(note.content, master_key)
+        except Exception:
+            note.content = "[unable to decrypt]"
         return note
 
 @app.put("/notes/{note_id}", response_model=NoteResponse)
 async def update_note(note_id: int, note: NoteSchema):
     from sqlalchemy import select
-    key = get_encryption_key()
+    master_key = get_encryption_key()
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Note).filter(Note.id == note_id))
         db_note = result.scalar_one_or_none()
         if not db_note:
             raise HTTPException(status_code=404, detail="Note not found")
+        # generate a new per-note DEK for the updated content
+        dek = generate_key()
         db_note.title = note.title
-        db_note.content = encrypt_content(note.content, key)
+        db_note.content = encrypt_content(note.content, dek)
+        db_note.wrapped_key = wrap_key(dek, master_key)
         db_note.updated_at = datetime.utcnow()
         await session.commit()
         await session.refresh(db_note)
         # Decrypt for response
-        db_note.content = decrypt_content(db_note.content, key)
+        try:
+            dek = unwrap_key(db_note.wrapped_key, master_key) if db_note.wrapped_key else master_key
+            db_note.content = decrypt_content(db_note.content, dek)
+        except Exception:
+            db_note.content = "[unable to decrypt]"
         return db_note
 
 @app.delete("/notes/{note_id}")
@@ -227,6 +288,9 @@ async def delete_note(note_id: int):
         db_note = result.scalar_one_or_none()
         if not db_note:
             raise HTTPException(status_code=404, detail="Note not found")
+        # Zero the wrapped key first to ensure cryptographic deletion of DEK material
+        db_note.wrapped_key = None
+        await session.commit()
         await session.delete(db_note)
         await session.commit()
         return {"message": "Note deleted"}
@@ -894,6 +958,13 @@ async def login_process(
         user.failed_login_attempts += 1
         apply_lockout_policy(user)
         await db.commit()
+        # Log failed login attempt
+        try:
+            ip = request.client.host if request.client else None
+            device = device_fingerprint_string(request)
+            await log_activity(db, user.id, ip, device, "login", success=False)
+        except Exception as e:
+            print(f"Activity logging failed: {e}")
         return templates.TemplateResponse(
             "login.html",
             {"request": request, "error": "Incorrect email or password"}
@@ -1072,6 +1143,32 @@ async def verify_2fa(
         user.failed_login_attempts = 0
         user.lockout_until = None
         user.status = "active"
+
+        # Log successful login attempt
+        try:
+            ip = request.client.host if request.client else None
+            device = device_fingerprint_string(request)
+            await log_activity(db, user.id, ip, device, "login", success=True)
+        except Exception as e:
+            print(f"Activity logging failed: {e}")
+
+        # Anomaly detection check (if model loaded, require step-up if suspicious)
+        try:
+            model = getattr(app.state, "anomaly_model", None)
+            if model:
+                suspicious = check_anomaly(model, get_sg_time(), True)
+                if suspicious:
+                    # Alert user and force additional verification (change backup PIN)
+                    send_security_email(
+                        "Suspicious login detected",
+                        user.email,
+                        "<p>We detected a suspicious login to your account. Please review your activity and change your backup PIN.</p>",
+                    )
+                    user.must_change_backup_pin = True
+                    await db.commit()
+                    return RedirectResponse(url="/change-backup-pin", status_code=303)
+        except Exception as e:
+            print(f"Anomaly check failed: {e}")
 
         # Password reset continuation
         if pending and pending.action_type == "password_reset":
