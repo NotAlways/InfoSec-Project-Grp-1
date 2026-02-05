@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from passlib.context import CryptContext
 from itsdangerous import URLSafeTimedSerializer
-from .crypto import load_key, encrypt_content, decrypt_content
+from crypto import load_key, encrypt_content, decrypt_content
 from fastapi import Cookie
 from typing import Optional
 import asyncio
@@ -239,8 +239,10 @@ EMAIL_SERIALIZER = URLSafeTimedSerializer("EMAIL_TOKEN_SECRET_KEY")
 WEAK_PINS = ["123456", "000000", "111111", "222222", "333333", "444444", "555555", "666666", "777777", "888888", "999999", "654321"]
 
 # Path adjustment for your directory structure
-templates = Jinja2Templates(directory="frontend/templates")
-app.mount("/static", StaticFiles(directory="frontend"), name="static")
+from pathlib import Path
+_BASE_DIR = Path(__file__).parent.parent
+templates = Jinja2Templates(directory=str(_BASE_DIR / "frontend" / "templates"))
+app.mount("/static", StaticFiles(directory=str(_BASE_DIR / "frontend")), name="static")
 
 def get_sg_time():
     """Helper function to get current time in GMT+8 (Naive for DB compatibility)"""
