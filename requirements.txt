@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+sqlalchemy
+asyncpg
+python-multipart
+passlib[bcrypt]
+itsdangerous
+pyotp
+qrcode[pil]
+webauthn
+cryptography
+pyOpenSSL
+asn1crypto
+cbor2
+numpy
+python-dotenv
