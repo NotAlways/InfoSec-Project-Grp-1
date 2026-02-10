@@ -1876,11 +1876,13 @@ async def create_initial_admins():
 async def logout(request: Request, db: AsyncSession = Depends(get_db)):
     session_id = request.cookies.get("session_id")
     if session_id:
-        await db.execute(update(User).where(User.current_session_id == session_id).values(current_session_id=None))
+        await db.execute(
+            update(User).where(User.current_session_id == session_id).values(current_session_id=None)
+        )
         await db.commit()
 
-        response = RedirectResponse(url="/login", status_code=303)
-        response.delete_cookie("session_id", path="/")
-        response.delete_cookie(ADMIN_PASSKEY_COOKIE, path="/")  # ✅ important
-        response.delete_cookie("device_token", path="/")
-        return response
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie("session_id", path="/")
+    response.delete_cookie(ADMIN_PASSKEY_COOKIE, path="/")
+    # ✅ DO NOT delete device_token here (keep the device trusted)
+    return response
