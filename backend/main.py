@@ -55,6 +55,7 @@ from urllib.parse import quote
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy.ext.mutable import MutableList
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -263,28 +264,54 @@ def get_backup_pin_history_limit(user: "User") -> int:
 
 def backup_pin_reused(user: "User", new_pin: str) -> bool:
     # Blocks reuse of current pin + last N pin hashes
+
+    # 1) Block current PIN
     try:
         if user.backup_pin_hash and pwd_context.verify(new_pin, user.backup_pin_hash):
             return True
     except Exception:
+        # If current hash is malformed, fail safe
         return True
 
-    history = user.backup_pin_history or []
+    # 2) Normalize history into a Python list
+    history = user.backup_pin_history
+    if history is None:
+        history = []
+    elif isinstance(history, str):
+        # If stored/returned as JSON string for any reason
+        try:
+            history = json.loads(history)
+        except Exception:
+            history = []
+
+    # 3) Check last N history hashes
     limit = get_backup_pin_history_limit(user)
     for old_hash in history[-limit:]:
+        if not old_hash:
+            continue
         try:
             if pwd_context.verify(new_pin, old_hash):
                 return True
         except Exception:
-            # If an old hash is malformed, be safe and treat as reused
+            # Malformed hash -> fail safe
             return True
+
     return False
 
 def push_backup_pin_history(user: "User"):
     # Store the previous pin hash, keep only last N
     if not user.backup_pin_hash:
         return
-    history = user.backup_pin_history or []
+
+    history = user.backup_pin_history
+    if history is None:
+        history = []
+    elif isinstance(history, str):
+        try:
+            history = json.loads(history)
+        except Exception:
+            history = []
+
     history.append(user.backup_pin_hash)
 
     limit = get_backup_pin_history_limit(user)
@@ -364,7 +391,7 @@ class User(Base):
     password_history = Column(JSON, default=list)
     totp_secret = Column(String)
     backup_pin_hash = Column(String)
-    backup_pin_history = Column(JSON, default=list)
+    backup_pin_history = Column(MutableList.as_mutable(JSON), default=list)
     backup_pin_changed_at = Column(DateTime, default=get_sg_time)
     must_change_backup_pin = Column(Boolean, default=False)
     role = Column(String, default="user")
@@ -507,10 +534,11 @@ async def get_copy_text(
 # Dashboard
 @app.get("/home", name="dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, user: User = Depends(verify_session)):
+    message = request.query_params.get("message")  # ✅ read from /home?message=...
     return templates.TemplateResponse("index.html", {
         "request": request,
-        "user": user, 
-        "message": f"Welcome back, {user.username}"
+        "user": user,
+        "message": message or f"Welcome back, {user.username}"
     })
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -931,9 +959,19 @@ async def login_process(
 
         token = EMAIL_SERIALIZER.dumps(email, salt=pending_session_id)
         verify_url = f"https://localhost:8000/verify-login?token={token}"
+        client_ip = request.client.host if request.client else "Unknown"
+        user_agent = request.headers.get("user-agent", "Unknown")
+        accept_lang = request.headers.get("accept-language", "Unknown")
+        login_time = get_sg_time().strftime("%d-%m-%Y, %H:%M:%S (SGT)")
+
         html_body = (
             f"<h2>New Device Login</h2>"
-            f"<p>We detected a login from a new device. If this is you, authorize this session:</p>"
+            f"<p>We detected a login attempt from a new device. If this is you, authorize this session:</p>"
+            f'<p><b>IP Address:</b> {client_ip}<br>'
+            f"<b>Device/Browser (User-Agent):</b> {user_agent}<br>"
+            f"<b>Language:</b> {accept_lang}<br>"
+            f"<b>Time:</b> {login_time}</p>"
+            f"<p>If you do not recognize this activity, do not authorize it and consider changing your password.</p>"
             f'<a href="{verify_url}" style="background:#2c3e50;color:white;padding:10px 20px;'
             f'text-decoration:none;border-radius:5px;">Authorize Login</a>'
         )
@@ -1299,7 +1337,10 @@ async def change_backup_pin_submit(
     user.must_change_backup_pin = False
 
     await db.commit()
-    return RedirectResponse(url="/home?message=Recovery PIN updated successfully", status_code=303)
+    return RedirectResponse(
+    url=f"/home?message=Recovery%20Pin%20changed%20successfully&t={int(time.time())}",
+    status_code=303
+)
 
 
 # --- ADMIN ---

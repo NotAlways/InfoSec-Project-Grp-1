@@ -57,17 +57,24 @@
   </div>
 
   <script>
-    // Logic to check if the message has been dismissed
     (function () {
       const msg = "{{ message or '' }}";
       const safeMsg = (msg && msg !== "None") ? msg : "";
-      const storageKey = "dismissed_" + btoa(unescape(encodeURIComponent(safeMsg))).substring(0, 16);
+
+      // ✅ NEW: read unique event token from URL so message can show again
+      const urlParams = new URLSearchParams(window.location.search);
+      const t = urlParams.get("t") || "";
+
+      // ✅ storage key now includes t, so each change-pin redirect can show again
+      const storageKey =
+        "dismissed_" +
+        btoa(unescape(encodeURIComponent(safeMsg))).substring(0, 16) +
+        "_" + t;
 
       if (!sessionStorage.getItem(storageKey)) {
         document.getElementById('statusAlert').style.display = 'flex';
       }
 
-      // Define the close function
       window.closeAlert = function () {
         document.getElementById('statusAlert').style.display = 'none';
         sessionStorage.setItem(storageKey, "true");
