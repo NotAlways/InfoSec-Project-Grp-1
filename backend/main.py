@@ -339,6 +339,149 @@ def set_trusted_device_cookie(response: RedirectResponse, user: "User"):
     )
 
 
+TRUSTED_DEVICE_COOKIE = "device_token"
+TRUST_DAYS = 30
+
+def _hash_ua(ua: str) -> str:
+    ua = ua or ""
+    return hashlib.sha256(ua.encode("utf-8")).hexdigest()
+
+def _parse_device_cookie(val: str) -> tuple[str, str] | tuple[None, None]:
+    # format: "<device_id>.<secret>"
+    if not val or "." not in val:
+        return (None, None)
+    device_id, secret = val.split(".", 1)
+    if not device_id or not secret:
+        return (None, None)
+    return (device_id, secret)
+
+def _set_trusted_device_cookie(response: RedirectResponse, device_id: str, secret: str):
+    response.set_cookie(
+        key=TRUSTED_DEVICE_COOKIE,
+        value=f"{device_id}.{secret}",
+        max_age=60 * 60 * 24 * TRUST_DAYS,
+        httponly=True,
+        samesite="lax",
+        secure=True,   # IMPORTANT since you're using https://localhost
+        path="/",
+    )
+
+async def is_trusted_device(request: Request, user: "User", db: AsyncSession) -> bool:
+    raw = request.cookies.get(TRUSTED_DEVICE_COOKIE)
+    device_id, secret = _parse_device_cookie(raw)
+    if not device_id:
+        return False
+
+    res = await db.execute(
+        select(TrustedDevice).where(
+            TrustedDevice.id == device_id,
+            TrustedDevice.user_email == user.email,
+            TrustedDevice.revoked_at.is_(None),
+        )
+    )
+    td = res.scalar_one_or_none()
+    if not td:
+        return False
+
+    # Verify cookie secret against server-stored hash
+    try:
+        if not pwd_context.verify(secret, td.secret_hash):
+            return False
+    except Exception:
+        return False
+
+    # Optional: UA consistency check (helps against cookie theft)
+    current_ua_hash = _hash_ua(request.headers.get("user-agent", ""))
+    if td.ua_hash and td.ua_hash != current_ua_hash:
+        return False
+
+    # Update last seen (best effort)
+    td.last_seen_at = get_sg_time()
+    await db.commit()
+
+    return True
+
+async def trust_this_device(request: Request, user: "User", db: AsyncSession, response: RedirectResponse):
+    """
+    Creates or refreshes trust for this browser/profile.
+    If cookie already exists and is valid, just refresh last_seen and cookie expiry.
+    Otherwise create a new TrustedDevice entry.
+    """
+    raw = request.cookies.get(TRUSTED_DEVICE_COOKIE)
+    device_id, secret = _parse_device_cookie(raw)
+
+    ua_hash = _hash_ua(request.headers.get("user-agent", ""))
+
+    # If an existing cookie is present, try to reuse device_id
+    if device_id:
+        res = await db.execute(
+            select(TrustedDevice).where(
+                TrustedDevice.id == device_id,
+                TrustedDevice.user_email == user.email,
+                TrustedDevice.revoked_at.is_(None),
+            )
+        )
+        td = res.scalar_one_or_none()
+        if td:
+            # Refresh expiry + last seen
+            td.last_seen_at = get_sg_time()
+            td.ua_hash = ua_hash  # keep updated
+            await db.commit()
+
+            # Also refresh cookie max_age by re-setting it
+            # NOTE: we cannot recover the original secret, so only refresh if current cookie is valid
+            try:
+                if pwd_context.verify(secret or "", td.secret_hash):
+                    _set_trusted_device_cookie(response, device_id, secret)
+            except Exception:
+                pass
+            return
+
+    # Otherwise create a new trusted device
+    new_device_id = str(uuid.uuid4())
+    new_secret = secrets.token_urlsafe(32)
+
+    td = TrustedDevice(
+        id=new_device_id,
+        user_email=user.email,
+        secret_hash=pwd_context.hash(new_secret),
+        ua_hash=ua_hash,
+        created_at=get_sg_time(),
+        last_seen_at=get_sg_time(),
+        revoked_at=None,
+    )
+    db.add(td)
+    await db.commit()
+
+    _set_trusted_device_cookie(response, new_device_id, new_secret)
+
+async def revoke_this_device(request: Request, user: "User", db: AsyncSession):
+    raw = request.cookies.get(TRUSTED_DEVICE_COOKIE)
+    device_id, secret = _parse_device_cookie(raw)
+    if not device_id:
+        return
+
+    res = await db.execute(
+        select(TrustedDevice).where(
+            TrustedDevice.id == device_id,
+            TrustedDevice.user_email == user.email,
+            TrustedDevice.revoked_at.is_(None),
+        )
+    )
+    td = res.scalar_one_or_none()
+    if not td:
+        return
+
+    # Only revoke if the cookie secret matches (prevents random revokes)
+    try:
+        if not pwd_context.verify(secret or "", td.secret_hash):
+            return
+    except Exception:
+        return
+
+    td.revoked_at = get_sg_time()
+    await db.commit()
+
 # --- WebAuthn / Passkeys (Platform Biometrics for Admins) ---
 WEBAUTHN_RP_ID = "localhost"                 # must match your domain
 WEBAUTHN_RP_NAME = "NoteVault"
@@ -423,6 +566,17 @@ class WebAuthnSession(Base):
     challenge = Column(String, nullable=False)         # base64url challenge
     created_at = Column(DateTime, default=get_sg_time)
     used = Column(Boolean, default=False)
+
+
+class TrustedDevice(Base):
+    __tablename__ = "trusted_devices"
+    id = Column(String, primary_key=True, index=True)          # device_id (uuid string)
+    user_email = Column(String, index=True, nullable=False)    # link to User.email
+    secret_hash = Column(String, nullable=False)               # hash(secret)
+    ua_hash = Column(String, nullable=True)                    # hash(user-agent) (optional but useful)
+    created_at = Column(DateTime, default=get_sg_time)
+    last_seen_at = Column(DateTime, default=get_sg_time)
+    revoked_at = Column(DateTime, nullable=True)
 
 
 def has_passkey(user: "User") -> bool:
@@ -925,21 +1079,8 @@ async def login_process(
             {"request": request, "error": "Incorrect email or password"}
         )
 
-    # 6. Device Recognition Check
-    device_token = request.cookies.get("device_token")
-    is_recognized_device = False
-
-    if device_token:
-        try:
-            token_email = EMAIL_SERIALIZER.loads(
-                device_token,
-                salt=user.device_key,
-                max_age=60 * 60 * 24 * 30
-            )
-            if token_email == email:
-                is_recognized_device = True
-        except:
-            is_recognized_device = False
+    # 6. Device Recognition Check (SERVER-SIDE TRUSTED DEVICES)
+    is_recognized_device = await is_trusted_device(request, user, db)
 
     # 7. Create a PENDING session id (real session comes only after 2FA/PIN)
     pending_session_id = str(uuid.uuid4())
@@ -1127,7 +1268,7 @@ async def verify_2fa(
 
             response = RedirectResponse(url="/change-backup-pin", status_code=303)
             response.set_cookie("session_id", new_sid, httponly=True, samesite="lax", path="/")
-            set_trusted_device_cookie(response, user)
+            await trust_this_device(request, user, db, response)
             response.delete_cookie("tmp_login", path="/")
             return response
 
@@ -1149,7 +1290,7 @@ async def verify_2fa(
             path="/"
         )
         
-        set_trusted_device_cookie(response, user)
+        await trust_this_device(request, user, db, response)
         response.delete_cookie("tmp_login", path="/")
         return response
 
@@ -1251,7 +1392,7 @@ async def verify_backup_pin(
 
             response = RedirectResponse(url="/change-backup-pin", status_code=303)
             response.set_cookie("session_id", new_sid, httponly=True, samesite="lax", path="/")
-            set_trusted_device_cookie(response, user)
+            await trust_this_device(request, user, db, response)
             response.delete_cookie("tmp_login", path="/")
             return response
 
@@ -1271,7 +1412,7 @@ async def verify_backup_pin(
             samesite="lax",
             path="/"
         )
-        set_trusted_device_cookie(response, user)
+        await trust_this_device(request, user, db, response)
         response.delete_cookie("tmp_login", path="/")
         return response
 
@@ -1885,4 +2026,21 @@ async def logout(request: Request, db: AsyncSession = Depends(get_db)):
     response.delete_cookie("session_id", path="/")
     response.delete_cookie(ADMIN_PASSKEY_COOKIE, path="/")
     # ✅ DO NOT delete device_token here (keep the device trusted)
+    return response
+
+@app.get("/logout-forget")
+async def logout_forget(request: Request, db: AsyncSession = Depends(get_db), user: User = Depends(verify_session)):
+    # revoke trust for THIS device on server
+    await revoke_this_device(request, user, db)
+
+    # clear current session
+    session_id = request.cookies.get("session_id")
+    if session_id:
+        await db.execute(update(User).where(User.current_session_id == session_id).values(current_session_id=None))
+        await db.commit()
+
+    response = RedirectResponse(url="/login?message=Logged%20out%20and%20device%20forgotten", status_code=303)
+    response.delete_cookie("session_id", path="/")
+    response.delete_cookie(ADMIN_PASSKEY_COOKIE, path="/")
+    response.delete_cookie(TRUSTED_DEVICE_COOKIE, path="/")  # delete local cookie too
     return response
