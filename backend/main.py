@@ -56,6 +56,12 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.ext.mutable import MutableList
+from io import BytesIO
+from fastapi.responses import StreamingResponse
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import inch
+
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -242,6 +248,10 @@ WEAK_PINS = ["123456", "000000", "111111", "222222", "333333", "444444", "555555
 templates = Jinja2Templates(directory="frontend/templates")
 app.mount("/static", StaticFiles(directory="frontend"), name="static")
 
+# --- SESSION SECURITY: Inactivity Auto Logout ---
+INACTIVITY_TIMEOUT_MINUTES = 15
+LAST_ACTIVITY_UPDATE_SECONDS = 60  # don't spam DB updates on every request
+
 def get_sg_time():
     """Helper function to get current time in GMT+8 (Naive for DB compatibility)"""
     # 1. Get time with TZ
@@ -251,6 +261,7 @@ def get_sg_time():
 
 
 BACKUP_PIN_MAX_AGE_DAYS = 180
+
 
 def is_backup_pin_expired(user: "User") -> bool:
     if not user.backup_pin_changed_at:
@@ -546,6 +557,7 @@ class User(Base):
     device_key = Column(String, default=lambda: str(uuid.uuid4()))
     created_at = Column(DateTime, default=get_sg_time)
     passkeys = Column(JSON, default=list)
+    last_activity_at = Column(DateTime, nullable=True)  # ✅ tracks last user activity for auto-logout
 
 
 class PendingAction(Base):
@@ -593,7 +605,25 @@ async def verify_session(request: Request, db: AsyncSession = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=303)
 
-    # ✅ GLOBAL PIN GATE (blocks everything except allowed pages)
+    now = get_sg_time()
+
+    # ✅ A) Inactivity Auto Logout
+    if user.last_activity_at:
+        inactive_seconds = (now - user.last_activity_at).total_seconds()
+        if inactive_seconds > (INACTIVITY_TIMEOUT_MINUTES * 60):
+            # invalidate session server-side
+            user.current_session_id = None
+            await db.commit()
+
+            # special signal for handler to clear cookies + redirect
+            raise HTTPException(status_code=440, detail="SESSION_EXPIRED")
+
+    # ✅ Update last activity (throttled to reduce DB writes)
+    if (not user.last_activity_at) or ((now - user.last_activity_at).total_seconds() > LAST_ACTIVITY_UPDATE_SECONDS):
+        user.last_activity_at = now
+        await db.commit()
+
+    # ✅ GLOBAL PIN GATE (your existing logic)
     pin_expired = is_backup_pin_expired(user) or bool(getattr(user, "must_change_backup_pin", False))
     path = request.url.path
 
@@ -604,12 +634,10 @@ async def verify_session(request: Request, db: AsyncSession = Depends(get_db)):
         "/",
     }
 
-    # allow static files + auth endpoints needed for completing login
     if path.startswith("/static") or path.startswith("/auth/") or path.startswith("/verify-"):
         return user
 
     if pin_expired and path not in allowed_paths:
-        # special signal to redirect to change pin
         raise HTTPException(status_code=409, detail="PIN_EXPIRED")
 
     return user
@@ -620,7 +648,18 @@ async def auth_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code == 303:
         return RedirectResponse(url="/login", status_code=303)
 
-    # ✅ If PIN expired, force /change-backup-pin
+    # ✅ Inactivity logout: clear session cookies and redirect
+    if exc.status_code == 440 and exc.detail == "SESSION_EXPIRED":
+        resp = RedirectResponse(
+            url="/login?error=Session%20expired%20due%20to%20inactivity.%20Please%20log%20in%20again",
+            status_code=303
+        )
+        resp.delete_cookie("session_id", path="/")
+        resp.delete_cookie("tmp_login", path="/")
+        resp.delete_cookie(ADMIN_PASSKEY_COOKIE, path="/")
+        # NOTE: We do NOT delete trusted device cookie (by your design)
+        return resp
+
     if exc.status_code == 409 and exc.detail == "PIN_EXPIRED":
         return RedirectResponse(url="/change-backup-pin", status_code=303)
 
@@ -654,6 +693,7 @@ async def startup_db():
         await conn.run_sync(Base.metadata.create_all)
 
 @app.get("/notes/{note_id}/copy-text")
+@limiter.limit("6/minute")
 async def get_copy_text(
     note_id: int,
     request: Request,
@@ -671,7 +711,7 @@ async def get_copy_text(
         content = decrypt_content(note.content, key) if note.content else ""
 
         # stamp
-        stamp_time = get_sg_time().strftime("%Y-%m-%d %H:%M:%S (SGT)")
+        stamp_time = get_sg_time().strftime("%d-%m-%Y %H:%M:%S (SGT)")
         stamped = (
             f"{note.title}\n\n{content}\n\n"
             f"— Copied from NoteVault by {user.email} on {stamp_time} • note_id={note_id}"
@@ -684,6 +724,118 @@ async def get_copy_text(
     )
 
     return {"text": stamped}
+
+@app.get("/notes/{note_id}/export-pdf")
+@limiter.limit("2/minute")
+async def export_note_pdf(
+    note_id: int,
+    request: Request,
+    user: User = Depends(verify_session),
+):
+    key = get_encryption_key()
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(Note).where(Note.id == note_id))
+        note = result.scalar_one_or_none()
+        if not note:
+            raise HTTPException(status_code=404, detail="Note not found")
+
+        # decrypt content
+        content = decrypt_content(note.content, key) if note.content else ""
+
+    # --- Build PDF in-memory ---
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    # InfoSec watermark stamp (non-repudiation / traceability)
+    stamp_time = get_sg_time().strftime("%d-%m-%Y %H:%M:%S (SGT)")
+    watermark_text = f"NoteVault • {user.email} • {user.username} • note_id={note_id} • {stamp_time}"
+
+    c.saveState()
+    try:
+        # If supported, real transparency
+        c.setFillAlpha(0.08)
+    except Exception:
+        # Fallback for older reportlab: just use light gray
+        pass
+
+    c.setFont("Helvetica-Bold", 22)
+    c.setFillColorRGB(0.2, 0.2, 0.2)
+    c.translate(width / 2, height / 2)
+    c.rotate(30)
+    c.drawCentredString(0, 0, watermark_text)
+    c.restoreState()
+
+    # Title + body
+    margin_x = 0.75 * inch
+    y = height - 1.0 * inch
+
+    c.setFont("Helvetica-Bold", 16)
+    c.setFillColorRGB(0, 0, 0)
+    c.drawString(margin_x, y, note.title or f"Note {note_id}")
+
+    y -= 0.4 * inch
+    c.setFont("Helvetica", 11)
+
+    # Simple word-wrap
+    max_width = width - (2 * margin_x)
+    words = (content or "").split()
+    line = ""
+
+    def flush_line(curr_y, text_line):
+        c.drawString(margin_x, curr_y, text_line)
+
+    for w in words:
+        test = (line + " " + w).strip()
+        if c.stringWidth(test, "Helvetica", 11) <= max_width:
+            line = test
+        else:
+            flush_line(y, line)
+            y -= 14
+            line = w
+            if y < 0.9 * inch:
+                c.showPage()
+                y = height - 1.0 * inch
+                # repeat watermark on new page
+                c.saveState()
+                try:
+                    c.setFillAlpha(0.08)
+                except Exception:
+                    pass
+                c.setFont("Helvetica-Bold", 22)
+                c.setFillColorRGB(0.2, 0.2, 0.2)
+                c.translate(width / 2, height / 2)
+                c.rotate(30)
+                c.drawCentredString(0, 0, watermark_text)
+                c.restoreState()
+                c.setFont("Helvetica", 11)
+
+    if line:
+        flush_line(y, line)
+
+    # Footer stamp (explicit attribution)
+    c.setFont("Helvetica-Oblique", 9)
+    c.setFillColorRGB(0.2, 0.2, 0.2)
+    c.drawRightString(width - margin_x, 0.6 * inch, watermark_text)
+
+    c.showPage()
+    c.save()
+
+    buffer.seek(0)
+
+    # Audit log (optional but good for InfoSec)
+    print(
+        f"AUDIT_EXPORT_PDF note_id={note_id} user={user.email} ip={request.client.host} "
+        f"ua={request.headers.get('user-agent','')}"
+    )
+
+    filename = f"note_{note_id}.pdf"
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
 
 # Dashboard
 @app.get("/home", name="dashboard", response_class=HTMLResponse)
@@ -1103,7 +1255,7 @@ async def login_process(
         client_ip = request.client.host if request.client else "Unknown"
         user_agent = request.headers.get("user-agent", "Unknown")
         accept_lang = request.headers.get("accept-language", "Unknown")
-        login_time = get_sg_time().strftime("%d-%m-%Y, %H:%M:%S (SGT)")
+        login_time = get_sg_time().strftime("%d %B %Y, %H:%M:%S (SGT)")
 
         html_body = (
             f"<h2>New Device Login</h2>"
@@ -1234,7 +1386,7 @@ async def verify_2fa(
 
     # ✅ NEW: must have an active login and password_reset session
     if not pending or pending.action_type not in ["login", "password_reset"]:
-        return redirect_with_error("/login", "Session expired. Please try again.")
+        return redirect_with_error("/login", "Session expired. Please try again")
 
     # ✅ NEW: must complete email verification step (for new device)
     if not pending.is_verified:
@@ -1358,7 +1510,7 @@ async def verify_backup_pin(
 
     # ✅ NEW: must have an active login session
     if not pending or pending.action_type not in ["login", "password_reset"]:
-        return redirect_with_error("/login", "Session expired. Please try again.")
+        return redirect_with_error("/login", "Session expired. Please try again")
 
     # ✅ NEW: must complete email verification step (for new device)
     if not pending.is_verified:
@@ -1488,6 +1640,7 @@ async def change_backup_pin_submit(
 
 @app.post("/admin/manage")
 async def manage_user(
+    request: Request,
     target: str, 
     action: str, 
     db: AsyncSession = Depends(get_db),
