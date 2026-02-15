@@ -30,6 +30,7 @@
             <div class="profile-email">{{ user.email }}</div>
           </div>
           <a href="/change-backup-pin">Change PIN</a>
+          <a href="javascript:void(0)" onclick="openTrash()">Recycle Bin</a>
           <a href="javascript:void(0)" onclick="logout()">Logout</a>
         </div>
       </li>
@@ -107,6 +108,20 @@
     <p>Recent logins, activity, alerts will appear here.</p>
   </div>
 
+  <div id="trash" class="section" style="display:none;">
+    <div class="section-header">
+      <h2>Recycle Bin</h2>
+      <button class="btn-secondary" onclick="showSection('notes')">Back to Notes</button>
+    </div>
+
+    <p class="muted">
+      Notes in Recycle Bin can be restored. Permanently deleted notes cannot be recovered. Please review carefully
+      before deleting
+    </p>
+
+    <div id="trashList" class="trash-list"></div>
+  </div>
+
   <!-- ✅ NEW: dropdown JS (place BEFORE app.js include) -->
   <script>
     function toggleProfileMenu(e) {
@@ -131,6 +146,7 @@
       email: "{{ user.email }}",
       username: "{{ user.username }}"
     };
+    window.NV_IS_ADMIN = {{ 'true' if user.role in ['admin', 'superadmin'] else 'false' }};
   </script>
   <!-- ✅ END COPY-ATTRIBUTION CONTEXT -->
 

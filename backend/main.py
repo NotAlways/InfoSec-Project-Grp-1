@@ -115,6 +115,7 @@ class NoteResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
 # FastAPI app
 app = FastAPI(title="NoteVault API")
 app.state.limiter = limiter
@@ -167,6 +168,13 @@ def send_security_email(subject: str, recipient: str, body_html: str):
     except Exception as e:
         print(f"CRITICAL: Email failed to send to {recipient}. Error: {e}")
         return False
+
+def get_sg_time():
+    """Helper function to get current time in GMT+8 (Naive for DB compatibility)"""
+    # 1. Get time with TZ
+    sg_time = datetime.now(timezone(timedelta(hours=8)))
+    # 2. Remove the TZ info so SQLAlchemy doesn't crash
+    return sg_time.replace(tzinfo=None)
 
 # Routes
 @app.on_event("startup")
@@ -226,18 +234,6 @@ async def update_note(note_id: int, note: NoteSchema):
         db_note.content = decrypt_content(db_note.content, key)
         return db_note
 
-@app.delete("/notes/{note_id}")
-async def delete_note(note_id: int):
-    from sqlalchemy import select
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Note).filter(Note.id == note_id))
-        db_note = result.scalar_one_or_none()
-        if not db_note:
-            raise HTTPException(status_code=404, detail="Note not found")
-        await session.delete(db_note)
-        await session.commit()
-        return {"message": "Note deleted"}
-
 
 # --- from here onwards Prathip's code ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -252,12 +248,43 @@ app.mount("/static", StaticFiles(directory="frontend"), name="static")
 INACTIVITY_TIMEOUT_MINUTES = 15
 LAST_ACTIVITY_UPDATE_SECONDS = 60  # don't spam DB updates on every request
 
-def get_sg_time():
-    """Helper function to get current time in GMT+8 (Naive for DB compatibility)"""
-    # 1. Get time with TZ
-    sg_time = datetime.now(timezone(timedelta(hours=8)))
-    # 2. Remove the TZ info so SQLAlchemy doesn't crash
-    return sg_time.replace(tzinfo=None)
+
+# --- NEW: Trash + Audit models ---
+
+class NoteTrash(Base):
+    __tablename__ = "notes_trash"
+    id = Column(Integer, primary_key=True, index=True)
+
+    original_note_id = Column(Integer, index=True, nullable=False)
+
+    title = Column(String, index=True)
+    content = Column(String)
+
+    created_at = Column(DateTime)
+    updated_at = Column(DateTime)
+
+    deleted_at = Column(DateTime, default=get_sg_time, index=True)
+
+    deleted_by_email = Column(String, index=True, nullable=False)
+    deleted_by_username = Column(String, nullable=True)
+
+    integrity_hmac = Column(String, nullable=True)
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+    id = Column(Integer, primary_key=True, index=True)
+    event_type = Column(String, index=True, nullable=False)  # NOTE_TRASHED, NOTE_RESTORED, TRASH_PURGED, etc.
+    actor_email = Column(String, index=True, nullable=True)
+    actor_role = Column(String, index=True, nullable=True)
+    ip = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+    note_id = Column(Integer, index=True, nullable=True)
+    trash_id = Column(Integer, index=True, nullable=True)
+    details = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=get_sg_time, index=True)
+
+# --- End: NEW Trash + Audit models ---
 
 
 BACKUP_PIN_MAX_AGE_DAYS = 180
@@ -607,18 +634,21 @@ async def verify_session(request: Request, db: AsyncSession = Depends(get_db)):
 
     now = get_sg_time()
 
-    # ✅ A) Inactivity Auto Logout
+    # ✅ A) Inactivity Auto Logout (compute inactive_seconds safely)
     if user.last_activity_at:
         inactive_seconds = (now - user.last_activity_at).total_seconds()
-        if inactive_seconds > (INACTIVITY_TIMEOUT_MINUTES * 60):
-            # invalidate session server-side
-            user.current_session_id = None
-            await db.commit()
+    else:
+        # If missing, treat as fresh login (or set it now)
+        inactive_seconds = 0
 
-            # special signal for handler to clear cookies + redirect
-            raise HTTPException(status_code=440, detail="SESSION_EXPIRED")
+    if inactive_seconds > (INACTIVITY_TIMEOUT_MINUTES * 60):
+        # invalidate session server-side
+        user.current_session_id = None
+        user.last_activity_at = None  # prevent immediate re-expire after login
+        await db.commit()
+        raise HTTPException(status_code=440, detail="SESSION_EXPIRED")
 
-    # ✅ Update last activity (throttled to reduce DB writes)
+    # ✅ Update last activity (throttled)
     if (not user.last_activity_at) or ((now - user.last_activity_at).total_seconds() > LAST_ACTIVITY_UPDATE_SECONDS):
         user.last_activity_at = now
         await db.commit()
@@ -687,10 +717,294 @@ def apply_lockout_policy(user: User):
             multiplier = (total_fails - (threshold - 1))
             user.lockout_until = get_sg_time() + timedelta(minutes=30 * multiplier)
 
+
+# --- NEW: Trash retention policy ---
+TRASH_RETENTION_DAYS = 30
+
+AUTO_TRASH_PURGE_INTERVAL_SECONDS = 10  # run once a day
+
+async def purge_expired_trash_system():
+    cutoff = get_sg_time() - timedelta(days=TRASH_RETENTION_DAYS)
+
+    async with AsyncSessionLocal() as db:
+        # Collect IDs first (so we can log purged_count)
+        res = await db.execute(select(NoteTrash.id).where(NoteTrash.deleted_at < cutoff))
+        ids = [r[0] for r in res.all()]
+
+        if ids:
+            await db.execute(delete(NoteTrash).where(NoteTrash.id.in_(ids)))
+            await db.commit()
+
+            # Log as SYSTEM purge (no request, no actor)
+            await audit_log(
+                db=db,
+                request=None,
+                event_type="TRASH_PURGED",
+                actor=None,
+                details={
+                    "mode": "expired_auto",
+                    "retention_days": TRASH_RETENTION_DAYS,
+                    "purged_count": len(ids),
+                },
+            )
+
+
+async def auto_purge_expired_trash_loop():
+    while True:
+        try:
+            await purge_expired_trash_system()
+        except Exception as e:
+            print("AUTO TRASH PURGE FAILED:", repr(e))
+        await asyncio.sleep(AUTO_TRASH_PURGE_INTERVAL_SECONDS)
+
+def _trash_hmac_secret() -> bytes:
+    # put this in env var in real deployment
+    return (os.getenv("TRASH_HMAC_SECRET") or "CHANGE_ME_TRASH_HMAC_SECRET").encode("utf-8")
+
+def compute_trash_hmac(payload: str) -> str:
+    return hashlib.sha256(_trash_hmac_secret() + payload.encode("utf-8")).hexdigest()
+
+async def audit_log(
+    db: AsyncSession,
+    request: Request | None,
+    event_type: str,
+    actor: "User" = None,
+    note_id: int = None,
+    trash_id: int = None,
+    details: dict = None,
+):
+    ev = AuditEvent(
+        event_type=event_type,
+        actor_email=getattr(actor, "email", None) if actor else None,
+        actor_role=getattr(actor, "role", None) if actor else None,
+        ip=(request.client.host if (request and request.client) else None),
+        user_agent=(request.headers.get("user-agent", None) if request else None),
+        note_id=note_id,
+        trash_id=trash_id,
+        details=details or {},
+        created_at=get_sg_time(),
+    )
+    db.add(ev)
+    await db.commit()
+
+
 @app.on_event("startup")
 async def startup_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+# --- NEW: Trash Routes ---
+
+@app.on_event("startup")
+async def start_auto_trash_purge():
+    # run once immediately
+    try:
+        await purge_expired_trash_system()
+    except Exception as e:
+        print("STARTUP TRASH PURGE FAILED:", repr(e))
+
+    # then run daily
+    asyncio.create_task(auto_purge_expired_trash_loop())
+
+def require_admin_passkey(request: Request, user: "User"):
+    if user.role not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Admins only")
+    if request.cookies.get(ADMIN_PASSKEY_COOKIE) != "1":
+        raise HTTPException(status_code=403, detail="Passkey verification required")
+
+@app.delete("/notes/{note_id}")
+@limiter.limit("10/minute")
+async def delete_note(
+    note_id: int,
+    request: Request,
+    user: User = Depends(verify_session),   # ✅ add this
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(Note).where(Note.id == note_id))
+    note = res.scalar_one_or_none()
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+
+    deleted_at = get_sg_time()
+    payload = f"{note.id}|{note.title}|{note.content}|{note.created_at}|{note.updated_at}|{deleted_at}|{user.email}"
+    h = compute_trash_hmac(payload)
+
+    trash = NoteTrash(
+        original_note_id=note.id,
+        title=note.title,
+        content=note.content,
+        created_at=note.created_at,
+        updated_at=note.updated_at,
+        deleted_at=deleted_at,
+        deleted_by_email=user.email,
+        deleted_by_username=user.username,
+        integrity_hmac=h,
+    )
+    db.add(trash)
+
+    await db.delete(note)
+    await db.commit()
+    await db.refresh(trash)
+
+    await audit_log(
+        db, request,
+        "NOTE_TRASHED",
+        actor=user,
+        note_id=note_id,
+        trash_id=trash.id,
+        details={"retention_days": TRASH_RETENTION_DAYS},
+    )
+
+    return {"message": "Note deleted", "trash_id": trash.id}
+
+
+@app.get("/trash")
+@limiter.limit("20/minute")
+async def list_my_trash(
+    request: Request,
+    user: User = Depends(verify_session),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(
+        select(NoteTrash)
+        .where(NoteTrash.deleted_by_email == user.email)
+        .order_by(NoteTrash.deleted_at.desc())
+    )
+    items = res.scalars().all()
+
+    # return minimal metadata (content stays encrypted; decrypt client-side only if needed)
+    return [
+        {
+            "trash_id": t.id,
+            "original_note_id": t.original_note_id,
+            "title": t.title,
+            "deleted_at": t.deleted_at,
+            "deleted_by_email": t.deleted_by_email,
+        }
+        for t in items
+    ]
+
+
+@app.post("/trash/{trash_id}/restore")
+@limiter.limit("10/minute")
+async def restore_from_trash(
+    trash_id: int,
+    request: Request,
+    user: User = Depends(verify_session),
+    db: AsyncSession = Depends(get_db),
+):
+    # ✅ Enforce "only the deleter can restore" (privacy-by-default)
+    res = await db.execute(
+        select(NoteTrash).where(
+            NoteTrash.id == trash_id,
+            NoteTrash.deleted_by_email == user.email,   # ✅ correct column
+        )
+    )
+    t = res.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Trash item not found")
+
+    # ✅ Integrity guard (HMAC)
+    payload = (
+        f"{t.original_note_id}|{t.title}|{t.content}|{t.created_at}|"
+        f"{t.updated_at}|{t.deleted_at}|{t.deleted_by_email}"
+    )
+    expected = compute_trash_hmac(payload)
+    if t.integrity_hmac and t.integrity_hmac != expected:
+        await audit_log(
+            db, request, "TRASH_TAMPER_DETECTED",
+            actor=user, trash_id=trash_id,
+            details={"reason": "HMAC mismatch"}
+        )
+        raise HTTPException(status_code=409, detail="Trash item integrity failed (possible tampering)")
+
+    # ✅ Save values BEFORE delete (safer)
+    original_note_id = t.original_note_id
+
+    # Restore note (still encrypted content stored)
+    restored = Note(
+        title=t.title,
+        content=t.content,
+        created_at=t.created_at or get_sg_time(),
+        updated_at=get_sg_time(),
+    )
+    db.add(restored)
+
+    await db.delete(t)
+    await db.commit()
+    await db.refresh(restored)
+
+    await audit_log(
+        db, request, "NOTE_RESTORED",
+        actor=user,
+        note_id=restored.id,
+        trash_id=trash_id,
+        details={"from_original_note_id": original_note_id},
+    )
+
+    return {"message": "Restored", "restored_note_id": restored.id}
+
+
+@app.delete("/trash/{trash_id}/purge")
+@limiter.limit("10/minute")
+async def purge_one_trash_item(
+    trash_id: int,
+    request: Request,
+    user: User = Depends(verify_session),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(NoteTrash).where(NoteTrash.id == trash_id))
+    t = res.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Trash item not found")
+
+    # ✅ Only the user who deleted it can permanently delete it
+    if t.deleted_by_email != user.email:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    await db.delete(t)
+    await db.commit()
+
+    await audit_log(
+        db,
+        request,
+        "TRASH_PURGED",
+        actor=user,
+        trash_id=trash_id,
+        details={"mode": "user_single"},
+    )
+
+    return {"message": "Permanently Deleted"}
+
+
+@app.post("/trash/purge-expired")
+@limiter.limit("2/minute")
+async def purge_expired_trash(
+    request: Request,
+    user: User = Depends(verify_session),
+    db: AsyncSession = Depends(get_db),
+):
+    # Admin-only + passkey
+    require_admin_passkey(request, user)
+
+    cutoff = get_sg_time() - timedelta(days=TRASH_RETENTION_DAYS)
+
+    # fetch ids for audit count
+    res = await db.execute(select(NoteTrash.id).where(NoteTrash.deleted_at < cutoff))
+    ids = [r[0] for r in res.all()]
+
+    if ids:
+        await db.execute(delete(NoteTrash).where(NoteTrash.id.in_(ids)))
+        await db.commit()
+
+    await audit_log(db, request, "TRASH_PURGED", actor=user, details={
+        "mode": "expired",
+        "retention_days": TRASH_RETENTION_DAYS,
+        "purged_count": len(ids),
+    })
+
+    return {"message": "Expired trash purged", "purged_count": len(ids), "retention_days": TRASH_RETENTION_DAYS}
+
 
 @app.get("/notes/{note_id}/copy-text")
 @limiter.limit("6/minute")
@@ -1124,7 +1438,8 @@ async def finalize_signup(
         totp_secret=secret,
         role="user",
         status="active",
-        current_session_id=session_id # Log them in immediately
+        current_session_id=session_id, # Log them in immediately
+        last_activity_at=get_sg_time(),
     )
     
     db.add(new_user)
@@ -1411,6 +1726,7 @@ async def verify_2fa(
         # FINAL LOGIN SUCCESS: create REAL session now
         new_sid = str(uuid.uuid4())
         user.current_session_id = new_sid
+        user.last_activity_at = get_sg_time()   # ✅ reset activity on fresh login
 
         pin_expired = is_backup_pin_expired(user) or bool(getattr(user, "must_change_backup_pin", False))
         if pin_expired:
@@ -1535,6 +1851,7 @@ async def verify_backup_pin(
         # FINAL LOGIN SUCCESS
         new_sid = str(uuid.uuid4())
         user.current_session_id = new_sid
+        user.last_activity_at = get_sg_time()   # ✅ reset activity on fresh login
         
         pin_expired = is_backup_pin_expired(user) or bool(getattr(user, "must_change_backup_pin", False))
         if pin_expired:

@@ -9,8 +9,8 @@ document.addEventListener("DOMContentLoaded", function () {
 });
 
 /* ✅ NEW: Ctrl+C Copy Stamping (best-effort)
-   - Works ONLY when user copies text inside the NoteVault page.
-   - Does NOT work if they copy outside the page, screenshot, etc.
+- Works ONLY when user copies text inside the NoteVault page.
+- Does NOT work if they copy outside the page, screenshot, etc.
 */
 document.addEventListener("copy", (e) => {
   try {
@@ -41,6 +41,48 @@ document.addEventListener("copy", (e) => {
   }
 });
 // ✅ END NEW
+
+function openTrash() {
+  showSection("trash");
+  loadTrash();
+}
+
+async function loadTrash() {
+  const trashList = document.getElementById("trashList");
+  trashList.innerHTML = "<p class='muted'>Loading...</p>";
+
+  try {
+    // ✅ Backend endpoint is GET /trash
+    const res = await fetch(`${API_URL}/trash`, { credentials: "include" });
+    if (!res.ok) {
+      trashList.innerHTML = "<p class='muted'>Failed to load Recycle Bin. Please login again</p>";
+      return;
+    }
+
+    const items = await res.json();
+    if (!items.length) {
+      trashList.innerHTML = "<p class='muted'>Recycle Bin is empty</p>";
+      return;
+    }
+
+    trashList.innerHTML = "";
+    items.forEach(t => {
+      const div = document.createElement("div");
+      div.className = "trash-item";
+      div.innerHTML = `
+        <h3>${t.title}</h3>
+        <div class="trash-meta">Deleted by ${t.deleted_by_email} on ${new Date(t.deleted_at).toLocaleString()}</div>
+        <div class="trash-actions">
+          <button class="btn-restore" onclick="restoreTrash(${t.trash_id})">Restore</button>
+          <button class="btn-danger" onclick="purgeTrash(${t.trash_id})">Permanent Delete</button>
+        </div>
+      `;
+      trashList.appendChild(div);
+    });
+  } catch (e) {
+    trashList.innerHTML = "<p class='muted'>Error loading Recycle Bin</p>";
+  }
+}
 
 function showSection(sectionId) {
   const sections = document.querySelectorAll(".section");
@@ -153,21 +195,25 @@ async function editNote(noteId) {
 }
 
 async function deleteNote(noteId) {
-  if (confirm("Are you sure you want to delete this note?")) {
-    try {
-      const response = await fetch(`${API_URL}/notes/${noteId}`, {
-        method: "DELETE"
-      });
-      if (response.ok) {
-        alert("Note deleted!");
-        loadNotes();
-      } else {
-        alert("Failed to delete note");
-      }
-    } catch (error) {
-      console.error("Error:", error);
-      alert("Error deleting note");
+  if (!confirm("Are you sure you want to delete this note?")) return;
+
+  try {
+    const response = await fetch(`${API_URL}/notes/${noteId}`, {
+      method: "DELETE",
+      credentials: "include" // ✅ REQUIRED so session cookie is sent
+    });
+
+    if (response.ok) {
+      alert("Note deleted!");
+      loadNotes();
+    } else {
+      const err = await response.text();
+      console.error("Delete failed:", response.status, err);
+      alert("Failed to delete note: " + err);
     }
+  } catch (error) {
+    console.error("Error:", error);
+    alert("Error deleting note");
   }
 }
 
@@ -244,5 +290,36 @@ async function exportNote(noteId) {
   } catch (e) {
     console.error("Export error:", e);
     alert("Export failed. Please try again");
+  }
+}
+
+/* ✅ UPDATED: Trash actions must call /trash/{trash_id}/... */
+async function restoreTrash(trashId) {
+  const res = await fetch(`${API_URL}/trash/${trashId}/restore`, {
+    method: "POST",
+    credentials: "include"
+  });
+
+  if (res.ok) {
+    loadTrash();
+    loadNotes(); // show restored note again
+  } else {
+    const err = await res.text();
+    alert("Restore failed: " + err);
+  }
+}
+
+async function purgeTrash(trashId) {
+  if (!confirm("Permanently delete this note? This cannot be undone")) return;
+
+  const res = await fetch(`${API_URL}/trash/${trashId}/purge`, {
+    method: "DELETE",
+    credentials: "include"
+  });
+
+  if (res.ok) loadTrash();
+  else {
+    const err = await res.text();
+    alert("Permanent delete failed: " + err);
   }
 }
