@@ -121,3 +121,38 @@ def decrypt_content(encrypted: str, key: bytes) -> str:
 def key_exists() -> bool:
     """Check if encryption key exists."""
     return KEY_FILE.exists()
+
+
+def wrap_key(dek: bytes, master_key: bytes) -> str:
+    """
+    Wrap (encrypt) a per-item DEK using the master key with AES-256-GCM.
+    Returns a base64 `nonce:ciphertext:tag` string.
+    """
+    nonce = secrets.token_bytes(12)
+    cipher = AESGCM(master_key)
+    ct = cipher.encrypt(nonce, dek, None)
+    actual_ct = ct[:-16]
+    tag = ct[-16:]
+    nonce_b64 = base64.b64encode(nonce).decode('utf-8')
+    ct_b64 = base64.b64encode(actual_ct).decode('utf-8')
+    tag_b64 = base64.b64encode(tag).decode('utf-8')
+    return f"{nonce_b64}:{ct_b64}:{tag_b64}"
+
+
+def unwrap_key(wrapped: str, master_key: bytes) -> bytes:
+    """
+    Unwrap (decrypt) a wrapped DEK string using the master key and return raw DEK bytes.
+    """
+    if not isinstance(wrapped, str) or ":" not in wrapped:
+        raise ValueError("Wrapped key is not in expected format")
+    try:
+        nonce_b64, ct_b64, tag_b64 = wrapped.split(":")
+        nonce = base64.b64decode(nonce_b64)
+        actual_ct = base64.b64decode(ct_b64)
+        tag = base64.b64decode(tag_b64)
+        full_ct = actual_ct + tag
+        cipher = AESGCM(master_key)
+        dek = cipher.decrypt(nonce, full_ct, None)
+        return dek
+    except Exception as e:
+        raise ValueError(f"Failed to unwrap key: {e}")
