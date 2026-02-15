@@ -125,12 +125,13 @@ async function loadNotes() {
       const noteItem = document.createElement("div");
       noteItem.className = "note-item";
       noteItem.innerHTML = `
-        <h3>${note.title}</h3>
-        <p>${note.content}</p>
-        <button onclick="editNote(${note.id})">Edit</button>
-        <button onclick="deleteNote(${note.id})">Delete</button>
-        <button onclick="copyNote(${note.id})">Copy</button>
-      `;
+      <h3>${note.title}</h3>
+      <p>${note.content}</p>
+      <button onclick="editNote(${note.id})">Edit</button>
+      <button onclick="deleteNote(${note.id})">Delete</button>
+      <button onclick="copyNote(${note.id})">Copy</button>
+      <button onclick="exportNote(${note.id})">Export PDF</button>
+    `;
       noteList.appendChild(noteItem);
     });
   } catch (error) {
@@ -212,5 +213,36 @@ async function copyNote(noteId) {
   } catch (e) {
     console.error("Copy error:", e);
     alert("Copy failed. Please try again");
+  }
+}
+
+async function exportNote(noteId) {
+  try {
+    const res = await fetch(`${API_URL}/notes/${noteId}/export-pdf`, {
+      method: "GET",
+      credentials: "include"
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      console.error("Export failed:", res.status, err);
+      alert("Failed to export. Please login again");
+      return;
+    }
+
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `note_${noteId}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    window.URL.revokeObjectURL(url);
+  } catch (e) {
+    console.error("Export error:", e);
+    alert("Export failed. Please try again");
   }
 }

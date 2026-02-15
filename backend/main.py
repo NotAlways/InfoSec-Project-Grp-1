@@ -57,6 +57,13 @@ from urllib.parse import quote
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy.ext.mutable import MutableList
+from io import BytesIO
+from fastapi.responses import StreamingResponse
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import inch
+
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -307,6 +314,10 @@ _BASE_DIR = Path(__file__).parent.parent
 templates = Jinja2Templates(directory=str(_BASE_DIR / "frontend" / "templates"))
 app.mount("/static", StaticFiles(directory=str(_BASE_DIR / "frontend")), name="static")
 
+# --- SESSION SECURITY: Inactivity Auto Logout ---
+INACTIVITY_TIMEOUT_MINUTES = 15
+LAST_ACTIVITY_UPDATE_SECONDS = 60  # don't spam DB updates on every request
+
 def get_sg_time():
     """Helper function to get current time in GMT+8 (Naive for DB compatibility)"""
     # 1. Get time with TZ
@@ -316,6 +327,7 @@ def get_sg_time():
 
 
 BACKUP_PIN_MAX_AGE_DAYS = 180
+
 
 def is_backup_pin_expired(user: "User") -> bool:
     if not user.backup_pin_changed_at:
@@ -329,28 +341,54 @@ def get_backup_pin_history_limit(user: "User") -> int:
 
 def backup_pin_reused(user: "User", new_pin: str) -> bool:
     # Blocks reuse of current pin + last N pin hashes
+
+    # 1) Block current PIN
     try:
         if user.backup_pin_hash and pwd_context.verify(new_pin, user.backup_pin_hash):
             return True
     except Exception:
+        # If current hash is malformed, fail safe
         return True
 
-    history = user.backup_pin_history or []
+    # 2) Normalize history into a Python list
+    history = user.backup_pin_history
+    if history is None:
+        history = []
+    elif isinstance(history, str):
+        # If stored/returned as JSON string for any reason
+        try:
+            history = json.loads(history)
+        except Exception:
+            history = []
+
+    # 3) Check last N history hashes
     limit = get_backup_pin_history_limit(user)
     for old_hash in history[-limit:]:
+        if not old_hash:
+            continue
         try:
             if pwd_context.verify(new_pin, old_hash):
                 return True
         except Exception:
-            # If an old hash is malformed, be safe and treat as reused
+            # Malformed hash -> fail safe
             return True
+
     return False
 
 def push_backup_pin_history(user: "User"):
     # Store the previous pin hash, keep only last N
     if not user.backup_pin_hash:
         return
-    history = user.backup_pin_history or []
+
+    history = user.backup_pin_history
+    if history is None:
+        history = []
+    elif isinstance(history, str):
+        try:
+            history = json.loads(history)
+        except Exception:
+            history = []
+
     history.append(user.backup_pin_hash)
 
     limit = get_backup_pin_history_limit(user)
@@ -377,6 +415,149 @@ def set_trusted_device_cookie(response: RedirectResponse, user: "User"):
         path="/",
     )
 
+
+TRUSTED_DEVICE_COOKIE = "device_token"
+TRUST_DAYS = 30
+
+def _hash_ua(ua: str) -> str:
+    ua = ua or ""
+    return hashlib.sha256(ua.encode("utf-8")).hexdigest()
+
+def _parse_device_cookie(val: str) -> tuple[str, str] | tuple[None, None]:
+    # format: "<device_id>.<secret>"
+    if not val or "." not in val:
+        return (None, None)
+    device_id, secret = val.split(".", 1)
+    if not device_id or not secret:
+        return (None, None)
+    return (device_id, secret)
+
+def _set_trusted_device_cookie(response: RedirectResponse, device_id: str, secret: str):
+    response.set_cookie(
+        key=TRUSTED_DEVICE_COOKIE,
+        value=f"{device_id}.{secret}",
+        max_age=60 * 60 * 24 * TRUST_DAYS,
+        httponly=True,
+        samesite="lax",
+        secure=True,   # IMPORTANT since you're using https://localhost
+        path="/",
+    )
+
+async def is_trusted_device(request: Request, user: "User", db: AsyncSession) -> bool:
+    raw = request.cookies.get(TRUSTED_DEVICE_COOKIE)
+    device_id, secret = _parse_device_cookie(raw)
+    if not device_id:
+        return False
+
+    res = await db.execute(
+        select(TrustedDevice).where(
+            TrustedDevice.id == device_id,
+            TrustedDevice.user_email == user.email,
+            TrustedDevice.revoked_at.is_(None),
+        )
+    )
+    td = res.scalar_one_or_none()
+    if not td:
+        return False
+
+    # Verify cookie secret against server-stored hash
+    try:
+        if not pwd_context.verify(secret, td.secret_hash):
+            return False
+    except Exception:
+        return False
+
+    # Optional: UA consistency check (helps against cookie theft)
+    current_ua_hash = _hash_ua(request.headers.get("user-agent", ""))
+    if td.ua_hash and td.ua_hash != current_ua_hash:
+        return False
+
+    # Update last seen (best effort)
+    td.last_seen_at = get_sg_time()
+    await db.commit()
+
+    return True
+
+async def trust_this_device(request: Request, user: "User", db: AsyncSession, response: RedirectResponse):
+    """
+    Creates or refreshes trust for this browser/profile.
+    If cookie already exists and is valid, just refresh last_seen and cookie expiry.
+    Otherwise create a new TrustedDevice entry.
+    """
+    raw = request.cookies.get(TRUSTED_DEVICE_COOKIE)
+    device_id, secret = _parse_device_cookie(raw)
+
+    ua_hash = _hash_ua(request.headers.get("user-agent", ""))
+
+    # If an existing cookie is present, try to reuse device_id
+    if device_id:
+        res = await db.execute(
+            select(TrustedDevice).where(
+                TrustedDevice.id == device_id,
+                TrustedDevice.user_email == user.email,
+                TrustedDevice.revoked_at.is_(None),
+            )
+        )
+        td = res.scalar_one_or_none()
+        if td:
+            # Refresh expiry + last seen
+            td.last_seen_at = get_sg_time()
+            td.ua_hash = ua_hash  # keep updated
+            await db.commit()
+
+            # Also refresh cookie max_age by re-setting it
+            # NOTE: we cannot recover the original secret, so only refresh if current cookie is valid
+            try:
+                if pwd_context.verify(secret or "", td.secret_hash):
+                    _set_trusted_device_cookie(response, device_id, secret)
+            except Exception:
+                pass
+            return
+
+    # Otherwise create a new trusted device
+    new_device_id = str(uuid.uuid4())
+    new_secret = secrets.token_urlsafe(32)
+
+    td = TrustedDevice(
+        id=new_device_id,
+        user_email=user.email,
+        secret_hash=pwd_context.hash(new_secret),
+        ua_hash=ua_hash,
+        created_at=get_sg_time(),
+        last_seen_at=get_sg_time(),
+        revoked_at=None,
+    )
+    db.add(td)
+    await db.commit()
+
+    _set_trusted_device_cookie(response, new_device_id, new_secret)
+
+async def revoke_this_device(request: Request, user: "User", db: AsyncSession):
+    raw = request.cookies.get(TRUSTED_DEVICE_COOKIE)
+    device_id, secret = _parse_device_cookie(raw)
+    if not device_id:
+        return
+
+    res = await db.execute(
+        select(TrustedDevice).where(
+            TrustedDevice.id == device_id,
+            TrustedDevice.user_email == user.email,
+            TrustedDevice.revoked_at.is_(None),
+        )
+    )
+    td = res.scalar_one_or_none()
+    if not td:
+        return
+
+    # Only revoke if the cookie secret matches (prevents random revokes)
+    try:
+        if not pwd_context.verify(secret or "", td.secret_hash):
+            return
+    except Exception:
+        return
+
+    td.revoked_at = get_sg_time()
+    await db.commit()
 
 # --- WebAuthn / Passkeys (Platform Biometrics for Admins) ---
 WEBAUTHN_RP_ID = "localhost"                 # must match your domain
@@ -430,7 +611,7 @@ class User(Base):
     password_history = Column(JSON, default=list)
     totp_secret = Column(String)
     backup_pin_hash = Column(String)
-    backup_pin_history = Column(JSON, default=list)
+    backup_pin_history = Column(MutableList.as_mutable(JSON), default=list)
     backup_pin_changed_at = Column(DateTime, default=get_sg_time)
     must_change_backup_pin = Column(Boolean, default=False)
     role = Column(String, default="user")
@@ -442,6 +623,7 @@ class User(Base):
     device_key = Column(String, default=lambda: str(uuid.uuid4()))
     created_at = Column(DateTime, default=get_sg_time)
     passkeys = Column(JSON, default=list)
+    last_activity_at = Column(DateTime, nullable=True)  # ✅ tracks last user activity for auto-logout
 
 
 class PendingAction(Base):
@@ -464,6 +646,17 @@ class WebAuthnSession(Base):
     used = Column(Boolean, default=False)
 
 
+class TrustedDevice(Base):
+    __tablename__ = "trusted_devices"
+    id = Column(String, primary_key=True, index=True)          # device_id (uuid string)
+    user_email = Column(String, index=True, nullable=False)    # link to User.email
+    secret_hash = Column(String, nullable=False)               # hash(secret)
+    ua_hash = Column(String, nullable=True)                    # hash(user-agent) (optional but useful)
+    created_at = Column(DateTime, default=get_sg_time)
+    last_seen_at = Column(DateTime, default=get_sg_time)
+    revoked_at = Column(DateTime, nullable=True)
+
+
 def has_passkey(user: "User") -> bool:
     return bool(user.passkeys and isinstance(user.passkeys, list) and len(user.passkeys) > 0)
 
@@ -478,7 +671,25 @@ async def verify_session(request: Request, db: AsyncSession = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=303)
 
-    # ✅ GLOBAL PIN GATE (blocks everything except allowed pages)
+    now = get_sg_time()
+
+    # ✅ A) Inactivity Auto Logout
+    if user.last_activity_at:
+        inactive_seconds = (now - user.last_activity_at).total_seconds()
+        if inactive_seconds > (INACTIVITY_TIMEOUT_MINUTES * 60):
+            # invalidate session server-side
+            user.current_session_id = None
+            await db.commit()
+
+            # special signal for handler to clear cookies + redirect
+            raise HTTPException(status_code=440, detail="SESSION_EXPIRED")
+
+    # ✅ Update last activity (throttled to reduce DB writes)
+    if (not user.last_activity_at) or ((now - user.last_activity_at).total_seconds() > LAST_ACTIVITY_UPDATE_SECONDS):
+        user.last_activity_at = now
+        await db.commit()
+
+    # ✅ GLOBAL PIN GATE (your existing logic)
     pin_expired = is_backup_pin_expired(user) or bool(getattr(user, "must_change_backup_pin", False))
     path = request.url.path
 
@@ -489,12 +700,10 @@ async def verify_session(request: Request, db: AsyncSession = Depends(get_db)):
         "/",
     }
 
-    # allow static files + auth endpoints needed for completing login
     if path.startswith("/static") or path.startswith("/auth/") or path.startswith("/verify-"):
         return user
 
     if pin_expired and path not in allowed_paths:
-        # special signal to redirect to change pin
         raise HTTPException(status_code=409, detail="PIN_EXPIRED")
 
     return user
@@ -505,7 +714,18 @@ async def auth_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code == 303:
         return RedirectResponse(url="/login", status_code=303)
 
-    # ✅ If PIN expired, force /change-backup-pin
+    # ✅ Inactivity logout: clear session cookies and redirect
+    if exc.status_code == 440 and exc.detail == "SESSION_EXPIRED":
+        resp = RedirectResponse(
+            url="/login?error=Session%20expired%20due%20to%20inactivity.%20Please%20log%20in%20again",
+            status_code=303
+        )
+        resp.delete_cookie("session_id", path="/")
+        resp.delete_cookie("tmp_login", path="/")
+        resp.delete_cookie(ADMIN_PASSKEY_COOKIE, path="/")
+        # NOTE: We do NOT delete trusted device cookie (by your design)
+        return resp
+
     if exc.status_code == 409 and exc.detail == "PIN_EXPIRED":
         return RedirectResponse(url="/change-backup-pin", status_code=303)
 
@@ -539,6 +759,7 @@ async def startup_db():
         await conn.run_sync(Base.metadata.create_all)
 
 @app.get("/notes/{note_id}/copy-text")
+@limiter.limit("6/minute")
 async def get_copy_text(
     note_id: int,
     request: Request,
@@ -556,7 +777,7 @@ async def get_copy_text(
         content = decrypt_content(note.content, key) if note.content else ""
 
         # stamp
-        stamp_time = get_sg_time().strftime("%Y-%m-%d %H:%M:%S (SGT)")
+        stamp_time = get_sg_time().strftime("%d-%m-%Y %H:%M:%S (SGT)")
         stamped = (
             f"{note.title}\n\n{content}\n\n"
             f"— Copied from NoteVault by {user.email} on {stamp_time} • note_id={note_id}"
@@ -570,13 +791,126 @@ async def get_copy_text(
 
     return {"text": stamped}
 
+@app.get("/notes/{note_id}/export-pdf")
+@limiter.limit("2/minute")
+async def export_note_pdf(
+    note_id: int,
+    request: Request,
+    user: User = Depends(verify_session),
+):
+    key = get_encryption_key()
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(Note).where(Note.id == note_id))
+        note = result.scalar_one_or_none()
+        if not note:
+            raise HTTPException(status_code=404, detail="Note not found")
+
+        # decrypt content
+        content = decrypt_content(note.content, key) if note.content else ""
+
+    # --- Build PDF in-memory ---
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    # InfoSec watermark stamp (non-repudiation / traceability)
+    stamp_time = get_sg_time().strftime("%d-%m-%Y %H:%M:%S (SGT)")
+    watermark_text = f"NoteVault • {user.email} • {user.username} • note_id={note_id} • {stamp_time}"
+
+    c.saveState()
+    try:
+        # If supported, real transparency
+        c.setFillAlpha(0.08)
+    except Exception:
+        # Fallback for older reportlab: just use light gray
+        pass
+
+    c.setFont("Helvetica-Bold", 22)
+    c.setFillColorRGB(0.2, 0.2, 0.2)
+    c.translate(width / 2, height / 2)
+    c.rotate(30)
+    c.drawCentredString(0, 0, watermark_text)
+    c.restoreState()
+
+    # Title + body
+    margin_x = 0.75 * inch
+    y = height - 1.0 * inch
+
+    c.setFont("Helvetica-Bold", 16)
+    c.setFillColorRGB(0, 0, 0)
+    c.drawString(margin_x, y, note.title or f"Note {note_id}")
+
+    y -= 0.4 * inch
+    c.setFont("Helvetica", 11)
+
+    # Simple word-wrap
+    max_width = width - (2 * margin_x)
+    words = (content or "").split()
+    line = ""
+
+    def flush_line(curr_y, text_line):
+        c.drawString(margin_x, curr_y, text_line)
+
+    for w in words:
+        test = (line + " " + w).strip()
+        if c.stringWidth(test, "Helvetica", 11) <= max_width:
+            line = test
+        else:
+            flush_line(y, line)
+            y -= 14
+            line = w
+            if y < 0.9 * inch:
+                c.showPage()
+                y = height - 1.0 * inch
+                # repeat watermark on new page
+                c.saveState()
+                try:
+                    c.setFillAlpha(0.08)
+                except Exception:
+                    pass
+                c.setFont("Helvetica-Bold", 22)
+                c.setFillColorRGB(0.2, 0.2, 0.2)
+                c.translate(width / 2, height / 2)
+                c.rotate(30)
+                c.drawCentredString(0, 0, watermark_text)
+                c.restoreState()
+                c.setFont("Helvetica", 11)
+
+    if line:
+        flush_line(y, line)
+
+    # Footer stamp (explicit attribution)
+    c.setFont("Helvetica-Oblique", 9)
+    c.setFillColorRGB(0.2, 0.2, 0.2)
+    c.drawRightString(width - margin_x, 0.6 * inch, watermark_text)
+
+    c.showPage()
+    c.save()
+
+    buffer.seek(0)
+
+    # Audit log (optional but good for InfoSec)
+    print(
+        f"AUDIT_EXPORT_PDF note_id={note_id} user={user.email} ip={request.client.host} "
+        f"ua={request.headers.get('user-agent','')}"
+    )
+
+    filename = f"note_{note_id}.pdf"
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
 # Dashboard
 @app.get("/home", name="dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, user: User = Depends(verify_session)):
+    message = request.query_params.get("message")  # ✅ read from /home?message=...
     return templates.TemplateResponse("index.html", {
         "request": request,
-        "user": user, 
-        "message": f"Welcome back, {user.username}"
+        "user": user,
+        "message": message or f"Welcome back, {user.username}"
     })
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -970,21 +1304,8 @@ async def login_process(
             {"request": request, "error": "Incorrect email or password"}
         )
 
-    # 6. Device Recognition Check
-    device_token = request.cookies.get("device_token")
-    is_recognized_device = False
-
-    if device_token:
-        try:
-            token_email = EMAIL_SERIALIZER.loads(
-                device_token,
-                salt=user.device_key,
-                max_age=60 * 60 * 24 * 30
-            )
-            if token_email == email:
-                is_recognized_device = True
-        except:
-            is_recognized_device = False
+    # 6. Device Recognition Check (SERVER-SIDE TRUSTED DEVICES)
+    is_recognized_device = await is_trusted_device(request, user, db)
 
     # 7. Create a PENDING session id (real session comes only after 2FA/PIN)
     pending_session_id = str(uuid.uuid4())
@@ -1004,9 +1325,19 @@ async def login_process(
 
         token = EMAIL_SERIALIZER.dumps(email, salt=pending_session_id)
         verify_url = f"https://localhost:8000/verify-login?token={token}"
+        client_ip = request.client.host if request.client else "Unknown"
+        user_agent = request.headers.get("user-agent", "Unknown")
+        accept_lang = request.headers.get("accept-language", "Unknown")
+        login_time = get_sg_time().strftime("%d %B %Y, %H:%M:%S (SGT)")
+
         html_body = (
             f"<h2>New Device Login</h2>"
-            f"<p>We detected a login from a new device. If this is you, authorize this session:</p>"
+            f"<p>We detected a login attempt from a new device. If this is you, authorize this session:</p>"
+            f'<p><b>IP Address:</b> {client_ip}<br>'
+            f"<b>Device/Browser (User-Agent):</b> {user_agent}<br>"
+            f"<b>Language:</b> {accept_lang}<br>"
+            f"<b>Time:</b> {login_time}</p>"
+            f"<p>If you do not recognize this activity, do not authorize it and consider changing your password.</p>"
             f'<a href="{verify_url}" style="background:#2c3e50;color:white;padding:10px 20px;'
             f'text-decoration:none;border-radius:5px;">Authorize Login</a>'
         )
@@ -1128,7 +1459,7 @@ async def verify_2fa(
 
     # ✅ NEW: must have an active login and password_reset session
     if not pending or pending.action_type not in ["login", "password_reset"]:
-        return redirect_with_error("/login", "Session expired. Please try again.")
+        return redirect_with_error("/login", "Session expired. Please try again")
 
     # ✅ NEW: must complete email verification step (for new device)
     if not pending.is_verified:
@@ -1188,7 +1519,7 @@ async def verify_2fa(
 
             response = RedirectResponse(url="/change-backup-pin", status_code=303)
             response.set_cookie("session_id", new_sid, httponly=True, samesite="lax", path="/")
-            set_trusted_device_cookie(response, user)
+            await trust_this_device(request, user, db, response)
             response.delete_cookie("tmp_login", path="/")
             return response
 
@@ -1210,7 +1541,7 @@ async def verify_2fa(
             path="/"
         )
         
-        set_trusted_device_cookie(response, user)
+        await trust_this_device(request, user, db, response)
         response.delete_cookie("tmp_login", path="/")
         return response
 
@@ -1278,7 +1609,7 @@ async def verify_backup_pin(
 
     # ✅ NEW: must have an active login session
     if not pending or pending.action_type not in ["login", "password_reset"]:
-        return redirect_with_error("/login", "Session expired. Please try again.")
+        return redirect_with_error("/login", "Session expired. Please try again")
 
     # ✅ NEW: must complete email verification step (for new device)
     if not pending.is_verified:
@@ -1312,7 +1643,7 @@ async def verify_backup_pin(
 
             response = RedirectResponse(url="/change-backup-pin", status_code=303)
             response.set_cookie("session_id", new_sid, httponly=True, samesite="lax", path="/")
-            set_trusted_device_cookie(response, user)
+            await trust_this_device(request, user, db, response)
             response.delete_cookie("tmp_login", path="/")
             return response
 
@@ -1332,7 +1663,7 @@ async def verify_backup_pin(
             samesite="lax",
             path="/"
         )
-        set_trusted_device_cookie(response, user)
+        await trust_this_device(request, user, db, response)
         response.delete_cookie("tmp_login", path="/")
         return response
 
@@ -1398,13 +1729,17 @@ async def change_backup_pin_submit(
     user.must_change_backup_pin = False
 
     await db.commit()
-    return RedirectResponse(url="/home?message=Recovery PIN updated successfully", status_code=303)
+    return RedirectResponse(
+    url=f"/home?message=Recovery%20Pin%20changed%20successfully&t={int(time.time())}",
+    status_code=303
+)
 
 
 # --- ADMIN ---
 
 @app.post("/admin/manage")
 async def manage_user(
+    request: Request,
     target: str, 
     action: str, 
     db: AsyncSession = Depends(get_db),
@@ -1934,11 +2269,30 @@ async def create_initial_admins():
 async def logout(request: Request, db: AsyncSession = Depends(get_db)):
     session_id = request.cookies.get("session_id")
     if session_id:
+        await db.execute(
+            update(User).where(User.current_session_id == session_id).values(current_session_id=None)
+        )
+        await db.commit()
+
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie("session_id", path="/")
+    response.delete_cookie(ADMIN_PASSKEY_COOKIE, path="/")
+    # ✅ DO NOT delete device_token here (keep the device trusted)
+    return response
+
+@app.get("/logout-forget")
+async def logout_forget(request: Request, db: AsyncSession = Depends(get_db), user: User = Depends(verify_session)):
+    # revoke trust for THIS device on server
+    await revoke_this_device(request, user, db)
+
+    # clear current session
+    session_id = request.cookies.get("session_id")
+    if session_id:
         await db.execute(update(User).where(User.current_session_id == session_id).values(current_session_id=None))
         await db.commit()
 
-        response = RedirectResponse(url="/login", status_code=303)
-        response.delete_cookie("session_id", path="/")
-        response.delete_cookie(ADMIN_PASSKEY_COOKIE, path="/")  # ✅ important
-        response.delete_cookie("device_token", path="/")
-        return response
+    response = RedirectResponse(url="/login?message=Logged%20out%20and%20device%20forgotten", status_code=303)
+    response.delete_cookie("session_id", path="/")
+    response.delete_cookie(ADMIN_PASSKEY_COOKIE, path="/")
+    response.delete_cookie(TRUSTED_DEVICE_COOKIE, path="/")  # delete local cookie too
+    return response
