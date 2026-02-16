@@ -105,7 +105,80 @@
 
   <div id="dashboard" class="section" style="display:none;">
     <h2>Security Dashboard</h2>
-    <p>Recent logins, activity, alerts will appear here.</p>
+
+    <div class="dash-meta">
+      <div class="muted">Showing your activity only.</div>
+      <div id="dashStatus" class="dash-status muted"></div>
+    </div>
+
+    <div class="dash-controls">
+      <input id="dashSearch" type="text" placeholder="Search (IP, action, note_id, keyword, user-agent)">
+
+      <select id="dashType">
+        <option value="">All event types</option>
+        <option value="login">Login</option>
+        <option value="password_reset">Password Reset</option>
+        <option value="note">Notes</option>
+        <option value="trash">Recycle Bin</option>
+      </select>
+
+      <select id="dashSuccess">
+        <option value="">Success + Fail</option>
+        <option value="true">Success only</option>
+        <option value="false">Fail only</option>
+      </select>
+
+      <input id="dashFrom" type="date" />
+      <input id="dashTo" type="date" />
+
+      <button class="btn-secondary" onclick="resetDashboardFilters()">Reset</button>
+      <button onclick="loadDashboard()">Refresh</button>
+    </div>
+
+    <div class="dash-kpis">
+      <div class="kpi">
+        <div class="kpi-label">Total</div>
+        <div id="kpiTotal" class="kpi-value">0</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Success</div>
+        <div id="kpiSuccess" class="kpi-value">0</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Failed</div>
+        <div id="kpiFailed" class="kpi-value">0</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Last event</div>
+        <div id="kpiLast" class="kpi-value">—</div>
+      </div>
+    </div>
+
+    <div class="dash-table-wrap">
+      <table class="dash-table">
+        <thead>
+          <tr>
+            <th style="width: 170px;">Time</th>
+            <th style="width: 140px;">Type</th>
+            <th style="width: 90px;">Result</th>
+            <th style="width: 140px;">IP</th>
+            <th style="width: 120px;">Resource ID</th>
+            <th>Details</th>
+          </tr>
+        </thead>
+        <tbody id="dashRows">
+          <tr>
+            <td colspan="6" class="muted">Open Dashboard tab to load logs.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="dash-pager">
+      <button class="btn-secondary" onclick="dashPrevPage()">Prev</button>
+      <div class="muted"><span id="dashPageInfo">Page 1</span></div>
+      <button class="btn-secondary" onclick="dashNextPage()">Next</button>
+    </div>
   </div>
 
   <div id="trash" class="section" style="display:none;">

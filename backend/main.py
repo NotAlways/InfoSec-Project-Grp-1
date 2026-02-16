@@ -18,9 +18,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from passlib.context import CryptContext
 from itsdangerous import URLSafeTimedSerializer
-from crypto import load_key, encrypt_content, decrypt_content, generate_key, wrap_key, unwrap_key
-from activity import log_activity
-from anomaly import check_anomaly
+from backend.crypto import load_key, encrypt_content, decrypt_content, generate_key, wrap_key, unwrap_key
+from backend.activity import init_migration, log_activity
+from backend.anomaly import check_anomaly
 from fastapi import Cookie
 from typing import Optional
 import asyncio
@@ -82,7 +82,7 @@ APP_NAME = "NoteVault"
 
 # Database setup, change to your own password here. Make sure PostgreSQL is running. To be encrypted in the future.
 # password: 1m1f1b1m
-DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/notevault"
+DATABASE_URL = "postgresql+asyncpg://postgres:1m1f1b1m@localhost/notevault"
 Base = declarative_base()
 
 # Load encryption key on startup
@@ -198,7 +198,7 @@ async def startup():
 
     # Ensure user_activity table exists for activity logging
     try:
-        from activity import init_migration
+        from backend.activity import init_migration, log_activity
         await init_migration(engine)
         print("✓ Migration: user_activity table ready")
     except Exception as e:
@@ -206,7 +206,7 @@ async def startup():
 
     # Load anomaly detection model if available
     try:
-        from anomaly import load_model
+        from backend.anomaly import load_model
         model = load_model()
         app.state.anomaly_model = model
         if model:
@@ -295,20 +295,21 @@ async def update_note(note_id: int, note: NoteSchema):
             db_note.content = "[unable to decrypt]"
         return db_note
 
-@app.delete("/notes/{note_id}")
-async def delete_note(note_id: int):
-    from sqlalchemy import select
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(select(Note).filter(Note.id == note_id))
-        db_note = result.scalar_one_or_none()
-        if not db_note:
-            raise HTTPException(status_code=404, detail="Note not found")
-        # Zero the wrapped key first to ensure cryptographic deletion of DEK material
-        db_note.wrapped_key = None
-        await session.commit()
-        await session.delete(db_note)
-        await session.commit()
-        return {"message": "Note deleted"}
+
+# @app.delete("/notes/{note_id}")
+# async def delete_note(note_id: int):
+#     from sqlalchemy import select
+#     async with AsyncSessionLocal() as session:
+#         result = await session.execute(select(Note).filter(Note.id == note_id))
+#         db_note = result.scalar_one_or_none()
+#         if not db_note:
+#             raise HTTPException(status_code=404, detail="Note not found")
+#         # Zero the wrapped key first to ensure cryptographic deletion of DEK material
+#         db_note.wrapped_key = None
+#         await session.commit()
+#         await session.delete(db_note)
+#         await session.commit()
+#         return {"message": "Note deleted"}
 
 
 # --- from here onwards Prathip's code ---
@@ -337,6 +338,8 @@ class NoteTrash(Base):
 
     title = Column(String, index=True)
     content = Column(String)
+
+    wrapped_key = Column(String, nullable=True)
 
     created_at = Column(DateTime)
     updated_at = Column(DateTime)
@@ -895,14 +898,16 @@ def require_admin_passkey(request: Request, user: "User"):
 async def delete_note(
     note_id: int,
     request: Request,
-    user: User = Depends(verify_session),   # ✅ add this
+    user: User = Depends(verify_session),
     db: AsyncSession = Depends(get_db),
 ):
+    # 1) Load note
     res = await db.execute(select(Note).where(Note.id == note_id))
     note = res.scalar_one_or_none()
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
 
+    # 2) Create trash record (soft-delete)
     deleted_at = get_sg_time()
     payload = f"{note.id}|{note.title}|{note.content}|{note.created_at}|{note.updated_at}|{deleted_at}|{user.email}"
     h = compute_trash_hmac(payload)
@@ -910,7 +915,8 @@ async def delete_note(
     trash = NoteTrash(
         original_note_id=note.id,
         title=note.title,
-        content=note.content,
+        content=note.content,           # keep encrypted blob as-is
+        wrapped_key=note.wrapped_key,
         created_at=note.created_at,
         updated_at=note.updated_at,
         deleted_at=deleted_at,
@@ -920,13 +926,23 @@ async def delete_note(
     )
     db.add(trash)
 
+    # 3) Preserve teammate's crypto-delete intent:
+    #    wipe key material on the NOTE row before deleting it (only if column exists)
+    if hasattr(note, "wrapped_key"):
+        note.wrapped_key = None
+
+    # 4) Delete original note row
     await db.delete(note)
+
+    # 5) Commit once (atomic)
     await db.commit()
     await db.refresh(trash)
 
+    # 6) Audit
     await audit_log(
-        db, request,
-        "NOTE_TRASHED",
+        db=db,
+        request=request,
+        event_type="NOTE_TRASHED",
         actor=user,
         note_id=note_id,
         trash_id=trash.id,
@@ -1003,6 +1019,7 @@ async def restore_from_trash(
     restored = Note(
         title=t.title,
         content=t.content,
+        wrapped_key=getattr(t, "wrapped_key", None),
         created_at=t.created_at or get_sg_time(),
         updated_at=get_sg_time(),
     )
@@ -1100,7 +1117,13 @@ async def get_copy_text(
             raise HTTPException(status_code=404, detail="Note not found")
 
         # decrypt
-        content = decrypt_content(note.content, key) if note.content else ""
+        master_key = get_encryption_key()
+
+        if note.wrapped_key:
+            dek = unwrap_key(note.wrapped_key, master_key)
+            content = decrypt_content(note.content, dek)
+        else:
+            content = decrypt_content(note.content, master_key)
 
         # stamp
         stamp_time = get_sg_time().strftime("%d-%m-%Y %H:%M:%S (SGT)")
@@ -1133,7 +1156,13 @@ async def export_note_pdf(
             raise HTTPException(status_code=404, detail="Note not found")
 
         # decrypt content
-        content = decrypt_content(note.content, key) if note.content else ""
+        master_key = get_encryption_key()
+
+        if note.wrapped_key:
+            dek = unwrap_key(note.wrapped_key, master_key)
+            content = decrypt_content(note.content, dek)
+        else:
+            content = decrypt_content(note.content, master_key)
 
     # --- Build PDF in-memory ---
     buffer = BytesIO()

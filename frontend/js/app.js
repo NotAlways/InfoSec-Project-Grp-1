@@ -8,6 +8,320 @@ document.addEventListener("DOMContentLoaded", function () {
   loadNotes();
 });
 
+// ===== Security Dashboard (individual logs) =====
+let DASH_RAW = [];
+let DASH_PAGE = 1;
+const DASH_PAGE_SIZE = 15;
+
+// Candidate endpoints (we try in order). Keep frontend-only.
+// Your backend can expose ANY ONE of these and it will work.
+const DASH_ENDPOINTS = [
+  "/security/logs",
+  "/logs/me",
+  "/me/logs",
+  "/activity/me",
+  "/user-activity/me",
+  "/audit/me",
+  "/user/activity",
+  "/activity",
+];
+
+// Basic debounce helper
+function debounce(fn, wait = 250) {
+  let t = null;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), wait);
+  };
+}
+
+function setDashStatus(msg) {
+  const el = document.getElementById("dashStatus");
+  if (el) el.textContent = msg || "";
+}
+
+function normalizeEvent(row) {
+  // Accepts many backend shapes:
+  // - user_activity rows: {login_time, ip_address, action, success, ...}
+  // - audit_events rows: {created_at, event_type, ip, note_id, trash_id, details, ...}
+  const time =
+    row.time || row.created_at || row.login_time || row.timestamp || row.at || null;
+
+  const type =
+    row.type || row.event_type || row.action || row.event || "event";
+
+  // success can be: true/false, "true"/"false", 1/0, null (unknown)
+  let success = row.success;
+  if (typeof success === "string") success = (success.toLowerCase() === "true");
+  if (typeof success === "number") success = (success === 1);
+
+  const ip =
+    row.ip || row.ip_address || row.client_ip || row.remote_addr || "";
+
+  const noteId =
+    row.note_id ?? row.noteId ?? row.original_note_id ?? null;
+
+  const trashId =
+    row.trash_id ?? row.trashId ?? null;
+
+  const ua =
+    row.user_agent || row.ua || row.device || "";
+
+  const detailsObj = row.details || row.meta || {};
+  const detailsStr =
+    (typeof detailsObj === "string")
+      ? detailsObj
+      : JSON.stringify(detailsObj);
+
+  // combine for searching
+  const searchBlob = [
+    type,
+    ip,
+    ua,
+    noteId,
+    trashId,
+    detailsStr,
+    row.device_fingerprint,
+    row.reason,
+    row.message,
+  ]
+    .filter(v => v !== null && v !== undefined)
+    .join(" ")
+    .toLowerCase();
+
+  return {
+    raw: row,
+    time,
+    type,
+    success: (success === true ? true : (success === false ? false : null)),
+    ip,
+    noteId,
+    trashId,
+    ua,
+    detailsStr,
+    searchBlob
+  };
+}
+
+async function fetchDashboardLogs() {
+  setDashStatus("Loading logs...");
+  for (const path of DASH_ENDPOINTS) {
+    try {
+      const res = await fetch(`${API_URL}${path}`, {
+        method: "GET",
+        credentials: "include",
+      });
+      if (!res.ok) continue;
+
+      const data = await res.json();
+
+      // allow {items: [...]} or just [...]
+      const items = Array.isArray(data) ? data : (data.items || data.logs || []);
+      if (!Array.isArray(items)) continue;
+
+      setDashStatus(`Loaded from ${path}`);
+      return items;
+    } catch (e) {
+      // try next endpoint
+    }
+  }
+  setDashStatus("No logs endpoint found. (Frontend is ready, backend must expose one endpoint.)");
+  return [];
+}
+
+function inferBucket(typeStr) {
+  const t = (typeStr || "").toLowerCase();
+  if (t.includes("login")) return "login";
+  if (t.includes("password") || t.includes("reset")) return "password_reset";
+  if (t.includes("trash") || t.includes("purge") || t.includes("restore")) return "trash";
+  if (t.includes("note")) return "note";
+  if (t.includes("admin")) return "admin";
+  return "other";
+}
+
+function applyDashboardFilters() {
+  const q = (document.getElementById("dashSearch")?.value || "").trim().toLowerCase();
+  const typeFilter = document.getElementById("dashType")?.value || "";
+  const successFilter = document.getElementById("dashSuccess")?.value || "";
+  const fromVal = document.getElementById("dashFrom")?.value || "";
+  const toVal = document.getElementById("dashTo")?.value || "";
+
+  const fromDate = fromVal ? new Date(fromVal + "T00:00:00") : null;
+  const toDate = toVal ? new Date(toVal + "T23:59:59") : null;
+
+  return DASH_RAW.filter(ev => {
+    // Search
+    if (q && !ev.searchBlob.includes(q)) return false;
+
+    // Type bucket filter
+    if (typeFilter) {
+      const bucket = inferBucket(ev.type);
+      if (bucket !== typeFilter) return false;
+    }
+
+    // Success filter
+    if (successFilter !== "") {
+      const want = (successFilter === "true");
+      if (ev.success === null) return false;
+      if (ev.success !== want) return false;
+    }
+
+    // Date range filter
+    if (fromDate || toDate) {
+      const t = ev.time ? new Date(ev.time) : null;
+      if (!t || isNaN(t.getTime())) return false;
+      if (fromDate && t < fromDate) return false;
+      if (toDate && t > toDate) return false;
+    }
+
+    return true;
+  });
+}
+
+function renderDashboard() {
+  const rowsEl = document.getElementById("dashRows");
+  if (!rowsEl) return;
+
+  const filtered = applyDashboardFilters();
+
+  // Sort newest first (best effort)
+  filtered.sort((a, b) => {
+    const ta = a.time ? new Date(a.time).getTime() : 0;
+    const tb = b.time ? new Date(b.time).getTime() : 0;
+    return tb - ta;
+  });
+
+  // KPIs
+  const total = filtered.length;
+  const ok = filtered.filter(x => x.success === true).length;
+  const bad = filtered.filter(x => x.success === false).length;
+
+  const last = filtered[0]?.time ? new Date(filtered[0].time).toLocaleString() : "—";
+  const kpiTotal = document.getElementById("kpiTotal");
+  const kpiSuccess = document.getElementById("kpiSuccess");
+  const kpiFailed = document.getElementById("kpiFailed");
+  const kpiLast = document.getElementById("kpiLast");
+
+  if (kpiTotal) kpiTotal.textContent = String(total);
+  if (kpiSuccess) kpiSuccess.textContent = String(ok);
+  if (kpiFailed) kpiFailed.textContent = String(bad);
+  if (kpiLast) kpiLast.textContent = last;
+
+  // Pagination
+  const pages = Math.max(1, Math.ceil(filtered.length / DASH_PAGE_SIZE));
+  if (DASH_PAGE > pages) DASH_PAGE = pages;
+  if (DASH_PAGE < 1) DASH_PAGE = 1;
+
+  const start = (DASH_PAGE - 1) * DASH_PAGE_SIZE;
+  const slice = filtered.slice(start, start + DASH_PAGE_SIZE);
+
+  const pageInfo = document.getElementById("dashPageInfo");
+  if (pageInfo) pageInfo.textContent = `Page ${DASH_PAGE} / ${pages}`;
+
+  if (!slice.length) {
+    rowsEl.innerHTML = `<tr><td colspan="6" class="muted">No logs match your filters.</td></tr>`;
+    return;
+  }
+
+  rowsEl.innerHTML = "";
+  slice.forEach(ev => {
+    const dt = ev.time ? new Date(ev.time) : null;
+    const timeStr = (dt && !isNaN(dt.getTime())) ? dt.toLocaleString() : "—";
+
+    const bucket = inferBucket(ev.type);
+    const typeLabel = ev.type || bucket;
+
+    let badge = `<span class="badge badge-neutral">UNKNOWN</span>`;
+    if (ev.success === true) badge = `<span class="badge badge-ok">OK</span>`;
+    if (ev.success === false) badge = `<span class="badge badge-bad">FAIL</span>`;
+
+    const ipStr = ev.ip || "—";
+    const objRef = (ev.noteId != null) ? `note:${ev.noteId}` : ((ev.trashId != null) ? `trash:${ev.trashId}` : "—");
+
+    // Details: keep it short
+    let details = (ev.detailsStr || "").trim();
+    if (!details || details === "{}") details = "—";
+    if (details.length > 220) details = details.slice(0, 220) + "…";
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${timeStr}</td>
+      <td>${escapeHtml(typeLabel)}</td>
+      <td>${badge}</td>
+      <td>${escapeHtml(ipStr)}</td>
+      <td>${escapeHtml(String(objRef))}</td>
+      <td>${escapeHtml(details)}</td>
+    `;
+    rowsEl.appendChild(tr);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+async function loadDashboard() {
+  // Only load when dashboard exists
+  if (!document.getElementById("dashboard")) return;
+
+  // Try to fetch logs
+  const raw = await fetchDashboardLogs();
+
+  // Normalize
+  DASH_RAW = raw.map(normalizeEvent);
+
+  // Reset to page 1 on refresh
+  DASH_PAGE = 1;
+  renderDashboard();
+}
+
+function dashPrevPage() {
+  DASH_PAGE = Math.max(1, DASH_PAGE - 1);
+  renderDashboard();
+}
+
+function dashNextPage() {
+  DASH_PAGE = DASH_PAGE + 1;
+  renderDashboard();
+}
+
+function resetDashboardFilters() {
+  const s = document.getElementById("dashSearch");
+  const t = document.getElementById("dashType");
+  const ok = document.getElementById("dashSuccess");
+  const f = document.getElementById("dashFrom");
+  const to = document.getElementById("dashTo");
+
+  if (s) s.value = "";
+  if (t) t.value = "";
+  if (ok) ok.value = "";
+  if (f) f.value = "";
+  if (to) to.value = "";
+
+  DASH_PAGE = 1;
+  renderDashboard();
+}
+
+// Wire up dashboard inputs (once)
+document.addEventListener("DOMContentLoaded", function () {
+  const onChange = debounce(() => {
+    DASH_PAGE = 1;
+    renderDashboard();
+  }, 200);
+
+  const ids = ["dashSearch", "dashType", "dashSuccess", "dashFrom", "dashTo"];
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("input", onChange);
+    if (el) el.addEventListener("change", onChange);
+  });
+});
+
 /* ✅ NEW: Ctrl+C Copy Stamping (best-effort)
 - Works ONLY when user copies text inside the NoteVault page.
 - Does NOT work if they copy outside the page, screenshot, etc.
@@ -204,7 +518,7 @@ async function deleteNote(noteId) {
     });
 
     if (response.ok) {
-      alert("Note deleted!");
+      alert("Note moved to Recycle Bin!");
       loadNotes();
     } else {
       const err = await response.text();
