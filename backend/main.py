@@ -94,30 +94,6 @@ def get_encryption_key():
         encryption_key = load_key()
     return encryption_key
 
-# Models
-class Note(Base):
-    __tablename__ = "notes"
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String, index=True)
-    content = Column(String)
-    wrapped_key = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-class NoteSchema(BaseModel):
-    title: str
-    content: str
-
-class NoteResponse(BaseModel):
-    id: int
-    title: str
-    content: str
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
 
 # FastAPI app
 app = FastAPI(title="NoteVault API")
@@ -179,6 +155,104 @@ def get_sg_time():
     # 2. Remove the TZ info so SQLAlchemy doesn't crash
     return sg_time.replace(tzinfo=None)
 
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    password_history = Column(JSON, default=list)
+    totp_secret = Column(String)
+    backup_pin_hash = Column(String)
+    backup_pin_history = Column(MutableList.as_mutable(JSON), default=list)
+    backup_pin_changed_at = Column(DateTime, default=get_sg_time)
+    must_change_backup_pin = Column(Boolean, default=False)
+    role = Column(String, default="user")
+    status = Column(String, default="active")
+    failed_login_attempts = Column(Integer, default=0)
+    failed_2fa_attempts = Column(Integer, default=0) # Track 2FA/PIN separately
+    lockout_until = Column(DateTime, nullable=True)  # Progressive timer
+    current_session_id = Column(String, nullable=True)
+    device_key = Column(String, default=lambda: str(uuid.uuid4()))
+    created_at = Column(DateTime, default=get_sg_time)
+    passkeys = Column(JSON, default=list)
+    last_activity_at = Column(DateTime, nullable=True)  # ✅ tracks last user activity for auto-logout
+
+
+# Models
+class Note(Base):
+    __tablename__ = "notes"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, index=True)
+    content = Column(String)
+    wrapped_key = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class NoteSchema(BaseModel):
+    title: str
+    content: str
+
+class NoteResponse(BaseModel):
+    id: int
+    title: str
+    content: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+async def verify_session(request: Request, db: AsyncSession = Depends(get_db)):
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=303)
+
+    res = await db.execute(select(User).where(User.current_session_id == session_id))
+    user = res.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=303)
+
+    now = get_sg_time()
+
+    # ✅ A) Inactivity Auto Logout (compute inactive_seconds safely)
+    if user.last_activity_at:
+        inactive_seconds = (now - user.last_activity_at).total_seconds()
+    else:
+        # If missing, treat as fresh login (or set it now)
+        inactive_seconds = 0
+
+    if inactive_seconds > (INACTIVITY_TIMEOUT_MINUTES * 60):
+        # invalidate session server-side
+        user.current_session_id = None
+        user.last_activity_at = None  # prevent immediate re-expire after login
+        await db.commit()
+        raise HTTPException(status_code=440, detail="SESSION_EXPIRED")
+
+    # ✅ Update last activity (throttled)
+    if (not user.last_activity_at) or ((now - user.last_activity_at).total_seconds() > LAST_ACTIVITY_UPDATE_SECONDS):
+        user.last_activity_at = now
+        await db.commit()
+
+    # ✅ GLOBAL PIN GATE (your existing logic)
+    pin_expired = is_backup_pin_expired(user) or bool(getattr(user, "must_change_backup_pin", False))
+    path = request.url.path
+
+    allowed_paths = {
+        "/change-backup-pin",
+        "/logout",
+        "/login",
+        "/",
+    }
+
+    if path.startswith("/static") or path.startswith("/auth/") or path.startswith("/verify-"):
+        return user
+
+    if pin_expired and path not in allowed_paths:
+        raise HTTPException(status_code=409, detail="PIN_EXPIRED")
+
+    return user
+
 # Routes
 @app.on_event("startup")
 async def startup():
@@ -217,7 +291,7 @@ async def startup():
         print(f"Anomaly model load skipped: {e}")
 
 @app.post("/notes", response_model=NoteResponse)
-async def create_note(note: NoteSchema, db: AsyncSession = Depends(get_db)):
+async def create_note(note: NoteSchema, request: Request, user: User = Depends(verify_session), db: AsyncSession = Depends(get_db)):
     master_key = get_encryption_key()
     # generate a per-note DEK and encrypt the note with it
     dek = generate_key()
@@ -231,7 +305,7 @@ async def create_note(note: NoteSchema, db: AsyncSession = Depends(get_db)):
     return new_note
 
 @app.get("/notes", response_model=list[NoteResponse])
-async def get_notes():
+async def get_notes(request: Request, user: User = Depends(verify_session), db: AsyncSession = Depends(get_db),):
     from sqlalchemy import select
     master_key = get_encryption_key()
     async with AsyncSessionLocal() as session:
@@ -252,7 +326,7 @@ async def get_notes():
         return notes
 
 @app.get("/notes/{note_id}", response_model=NoteResponse)
-async def get_note(note_id: int):
+async def get_note(note_id: int, request: Request, user: User = Depends(verify_session), db: AsyncSession = Depends(get_db),):
     from sqlalchemy import select
     master_key = get_encryption_key()
     async with AsyncSessionLocal() as session:
@@ -271,7 +345,7 @@ async def get_note(note_id: int):
         return note
 
 @app.put("/notes/{note_id}", response_model=NoteResponse)
-async def update_note(note_id: int, note: NoteSchema):
+async def update_note(note_id: int, note: NoteSchema, request: Request, user: User = Depends(verify_session), db: AsyncSession = Depends(get_db),):
     from sqlalchemy import select
     master_key = get_encryption_key()
     async with AsyncSessionLocal() as session:
@@ -644,30 +718,6 @@ def is_device_match(request: Request, stored_hash: str) -> bool:
         return False
 
 
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True)
-    email = Column(String, unique=True, index=True)
-    hashed_password = Column(String)
-    password_history = Column(JSON, default=list)
-    totp_secret = Column(String)
-    backup_pin_hash = Column(String)
-    backup_pin_history = Column(MutableList.as_mutable(JSON), default=list)
-    backup_pin_changed_at = Column(DateTime, default=get_sg_time)
-    must_change_backup_pin = Column(Boolean, default=False)
-    role = Column(String, default="user")
-    status = Column(String, default="active")
-    failed_login_attempts = Column(Integer, default=0)
-    failed_2fa_attempts = Column(Integer, default=0) # Track 2FA/PIN separately
-    lockout_until = Column(DateTime, nullable=True)  # Progressive timer
-    current_session_id = Column(String, nullable=True)
-    device_key = Column(String, default=lambda: str(uuid.uuid4()))
-    created_at = Column(DateTime, default=get_sg_time)
-    passkeys = Column(JSON, default=list)
-    last_activity_at = Column(DateTime, nullable=True)  # ✅ tracks last user activity for auto-logout
-
-
 class PendingAction(Base):
     """Temporary table to track email verification status across tabs"""
     __tablename__ = "pending_actions"
@@ -701,57 +751,6 @@ class TrustedDevice(Base):
 
 def has_passkey(user: "User") -> bool:
     return bool(user.passkeys and isinstance(user.passkeys, list) and len(user.passkeys) > 0)
-
-
-async def verify_session(request: Request, db: AsyncSession = Depends(get_db)):
-    session_id = request.cookies.get("session_id")
-    if not session_id:
-        raise HTTPException(status_code=303)
-
-    res = await db.execute(select(User).where(User.current_session_id == session_id))
-    user = res.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=303)
-
-    now = get_sg_time()
-
-    # ✅ A) Inactivity Auto Logout (compute inactive_seconds safely)
-    if user.last_activity_at:
-        inactive_seconds = (now - user.last_activity_at).total_seconds()
-    else:
-        # If missing, treat as fresh login (or set it now)
-        inactive_seconds = 0
-
-    if inactive_seconds > (INACTIVITY_TIMEOUT_MINUTES * 60):
-        # invalidate session server-side
-        user.current_session_id = None
-        user.last_activity_at = None  # prevent immediate re-expire after login
-        await db.commit()
-        raise HTTPException(status_code=440, detail="SESSION_EXPIRED")
-
-    # ✅ Update last activity (throttled)
-    if (not user.last_activity_at) or ((now - user.last_activity_at).total_seconds() > LAST_ACTIVITY_UPDATE_SECONDS):
-        user.last_activity_at = now
-        await db.commit()
-
-    # ✅ GLOBAL PIN GATE (your existing logic)
-    pin_expired = is_backup_pin_expired(user) or bool(getattr(user, "must_change_backup_pin", False))
-    path = request.url.path
-
-    allowed_paths = {
-        "/change-backup-pin",
-        "/logout",
-        "/login",
-        "/",
-    }
-
-    if path.startswith("/static") or path.startswith("/auth/") or path.startswith("/verify-"):
-        return user
-
-    if pin_expired and path not in allowed_paths:
-        raise HTTPException(status_code=409, detail="PIN_EXPIRED")
-
-    return user
 
 
 @app.exception_handler(HTTPException)

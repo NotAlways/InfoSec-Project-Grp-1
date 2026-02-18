@@ -26,7 +26,7 @@ from activity import init_migration
 
 
 # Database URL (same as main.py)
-DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/notevault"
+DATABASE_URL = "postgresql+asyncpg://postgres:1m1f1b1m@localhost/notevault"
 
 
 async def retrain_model(

@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy import text
 
 # Database URL (same as main.py)
-DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/notevault"
+DATABASE_URL = "postgresql+asyncpg://postgres:1m1f1b1m@localhost/notevault"
 
 
 # Sample data pools
