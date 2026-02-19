@@ -29,7 +29,8 @@ from backend.crypto import (
     unwrap_key,
 )
 from backend.activity import init_migration, log_activity
-from backend.anomaly import check_anomaly
+from backend.anomaly import check_anomaly, load_model
+from pathlib import Path
 from fastapi import Cookie
 from typing import Optional
 import asyncio
@@ -91,7 +92,7 @@ APP_NAME = "NoteVault"
 
 # Database setup, change to your own password here. Make sure PostgreSQL is running. To be encrypted in the future.
 # password: 1m1f1b1m
-DATABASE_URL = "postgresql+asyncpg://postgres:1m1f1b1m@localhost/notevault"
+DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/notevault"
 Base = declarative_base()
 
 # Load encryption key on startup
@@ -278,6 +279,17 @@ async def startup():
             print("✓ Migration: Added wrapped_key column to notes table")
         except Exception as e:
             print(f"Migration note: wrapped_key column may already exist or migration skipped: {e}")
+        
+        # Migration: Add last_activity_at column to users table
+        try:
+            from sqlalchemy import text
+            await conn.execute(text("""
+                ALTER TABLE users 
+                ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMP
+            """))
+            print("✓ Migration: Added last_activity_at column to users table")
+        except Exception as e:
+            print(f"Migration note: last_activity_at column may already exist or migration skipped: {e}")
 
     # Ensure user_activity table exists for activity logging
     try:
@@ -1678,6 +1690,8 @@ async def login_process(
             "login.html",
             {"request": request, "error": "Incorrect email or password"}
         )
+    
+
 
     # 6. Device Recognition Check (SERVER-SIDE TRUSTED DEVICES)
     is_recognized_device = await is_trusted_device(request, user, db)
@@ -1745,6 +1759,89 @@ async def login_process(
     )
 
     return response
+
+@app.get("/admin/list-users")
+async def admin_list_users(current: User = Depends(verify_session), db: AsyncSession = Depends(get_db)):
+    if current.role not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    res = await db.execute(select(User))
+    users = res.scalars().all()
+    out = []
+    for u in users:
+        out.append({
+            "id": u.id,
+            "username": u.username,
+            "email": u.email,
+            "role": u.role,
+            "status": u.status,
+            "last_activity_at": u.last_activity_at.isoformat() if getattr(u, 'last_activity_at', None) else None,
+        })
+    return out
+
+
+@app.post("/admin/manage")
+async def admin_manage(target: str = None, action: str = None, current: User = Depends(verify_session), db: AsyncSession = Depends(get_db)):
+    if current.role not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if not target or not action:
+        raise HTTPException(status_code=400, detail="Missing target or action")
+    res = await db.execute(select(User).filter(User.email == target))
+    u = res.scalar_one_or_none()
+    if not u:
+        raise HTTPException(status_code=404, detail="Target user not found")
+
+    if action == "unlock":
+        u.status = "active"
+        u.failed_login_attempts = 0
+        u.failed_2fa_attempts = 0
+        u.lockout_until = None
+    elif action == "ban":
+        u.status = "banned"
+    else:
+        raise HTTPException(status_code=400, detail="Unknown action")
+
+    await db.commit()
+    return {"msg": f"Action '{action}' applied to {target}"}
+
+
+@app.get("/admin/activity")
+async def admin_activity(limit: int = 100, current: User = Depends(verify_session), db: AsyncSession = Depends(get_db)):
+    if current.role not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    # Fetch recent activity from user_activity table
+    q = """
+        SELECT ua.id, ua.user_id, ua.login_time, ua.ip_address, ua.device_info, ua.action, ua.success, u.email
+        FROM user_activity ua LEFT JOIN users u ON ua.user_id = u.id
+        ORDER BY ua.login_time DESC LIMIT :limit
+    """
+    res = await db.execute(__import__("sqlalchemy").text(q), {"limit": limit})
+    rows = res.fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "id": int(r[0]),
+            "user_id": int(r[1]) if r[1] is not None else None,
+            "login_time": r[2].isoformat() if r[2] else None,
+            "ip_address": r[3],
+            "device_info": r[4],
+            "action": r[5],
+            "success": bool(r[6]) if r[6] is not None else None,
+            "email": r[7],
+        })
+    return out
+
+
+@app.get("/admin/anomaly")
+async def admin_anomaly(current: User = Depends(verify_session)):
+    if current.role not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    model_file = Path(__file__).parent / "anomaly_model.pkl"
+    exists = model_file.exists()
+    info = {"model_exists": exists}
+    if exists:
+        info["modified_at"] = model_file.stat().st_mtime
+    return info
+
 
 @app.get("/verify-login", response_class=HTMLResponse)
 async def verify_login_link(token: str, db: AsyncSession = Depends(get_db)):

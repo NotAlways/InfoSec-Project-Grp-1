@@ -181,6 +181,13 @@
         <div id="tableWrapper">
             <p id="msg">Loading account data...</p>
         </div>
+
+        <hr>
+        <h3>Recent Activity</h3>
+        <div id="activityWrapper"><p>Loading activity...</p></div>
+
+        <h3>Anomaly Detection</h3>
+        <div id="anomalyWrapper"><p>Loading anomaly model status...</p></div>
     </div>
 
     <script>
@@ -312,6 +319,43 @@
                     showToast("Network Error: Check server connection", "error");
                 }
             };
+
+            async function loadActivity() {
+                const wrapper = document.getElementById('activityWrapper');
+                try {
+                    const res = await fetch('/admin/activity?limit=15');
+                    if (!res.ok) throw new Error('Failed to fetch activity');
+                    const rows = await res.json();
+                    if (!rows || rows.length === 0) {
+                        wrapper.innerHTML = '<p>No recent activity.</p>';
+                        return;
+                    }
+                    let html = '<table><thead><tr><th>Time</th><th>Email</th><th>Action</th><th>IP</th><th>Success</th></tr></thead><tbody>';
+                    rows.forEach(r => {
+                        html += `<tr><td>${r.login_time || ''}</td><td>${r.email || ''}</td><td>${r.action || ''}</td><td>${r.ip_address || ''}</td><td>${r.success}</td></tr>`;
+                    });
+                    html += '</tbody></table>';
+                    wrapper.innerHTML = html;
+                } catch (e) {
+                    wrapper.innerHTML = `<p style="color:red">${e.message}</p>`;
+                }
+            }
+
+            async function loadAnomaly() {
+                const wrapper = document.getElementById('anomalyWrapper');
+                try {
+                    const res = await fetch('/admin/anomaly');
+                    if (!res.ok) throw new Error('Failed to fetch anomaly status');
+                    const info = await res.json();
+                    wrapper.innerHTML = info.model_exists ? `<p>Model present (modified: ${new Date(info.modified_at*1000).toLocaleString()})</p>` : '<p>No trained anomaly model found.</p>';
+                } catch (e) {
+                    wrapper.innerHTML = `<p style="color:red">${e.message}</p>`;
+                }
+            }
+
+            // enhance loadTableData to also load activity & anomaly
+            const originalLoad = loadTableData;
+            loadTableData = async function() { await originalLoad(); await loadActivity(); await loadAnomaly(); };
 
             window.loadTableData = loadTableData;
         })();

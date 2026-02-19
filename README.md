@@ -1,8 +1,31 @@
 # InfoSec-Project-Grp-1
 
 # -LUCAS SECTION-
-# To run, u need to install postresql , run CREATE DATABASE notevault;, change the default password to your set password in main.py, then start the backend doing 'cd backend' then 'python -m uvicorn main:app --reload' or 'python -m uvicorn main:app --ssl-certfile cert.pem --ssl-keyfile key.pem' (if you have openssl) in terminal. Then navigate to index.html in your file explorer and open with browser. 
-# ~~For key gen, cd backend then run python init_crypto.py~~ NEW: keygen is automatically run after user acccount creation. 
+# To run, you need PostgreSQL installed and a database created: `CREATE DATABASE notevault;`.
+# Set your DB credentials via the `DATABASE_URL` environment variable (recommended) or update the connection string in `backend/main.py`.
+# Start the backend from the repository root so the `backend` package imports correctly:
+#
+# ```powershell
+# cd "<repo-root>"
+# python -m uvicorn backend.main:app --reload
+# # or (with SSL):
+# python -m uvicorn backend.main:app --ssl-certfile cert.pem --ssl-keyfile key.pem
+# ```
+#
+# If you still prefer to run from inside the `backend` folder, use this alternative:
+#
+# ```powershell
+# cd backend
+# python -m uvicorn main:app --reload
+# ```
+#
+# Key generation: the app will auto-generate and persist the master encryption key when the first user account is created.
+# To pre-generate the key manually, run:
+#
+# ```powershell
+# cd backend
+# python init_crypto.py
+# ```
 
 # For AI Anomaly Detector: 
 # Run to install dependencies: python -m pip install pandas scikit-learn joblib
