@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>NoteVault - Security Dashboard</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f5f5f5;
+            margin: 0;
+            padding: 20px;
+        }
+
+        .dashboard-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            padding: 30px;
+        }
+
+        .dashboard-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            border-bottom: 2px solid #2c3e50;
+            padding-bottom: 20px;
+        }
+
+        .dashboard-header h1 {
+            margin: 0;
+            color: #2c3e50;
+            font-size: 2em;
+        }
+
+        .user-info {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            font-size: 0.95em;
+        }
+
+        .user-info span {
+            padding: 5px 12px;
+            background: #ecf0f1;
+            border-radius: 4px;
+            border-left: 3px solid #3498db;
+        }
+
+        .stats-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            transition: transform 0.3s ease;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .stat-card.success {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        }
+
+        .stat-card.warning {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+
+        .stat-card.info {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        }
+
+        .stat-value {
+            font-size: 2.5em;
+            font-weight: bold;
+            display: block;
+            margin: 10px 0;
+        }
+
+        .stat-label {
+            font-size: 0.9em;
+            opacity: 0.9;
+        }
+
+        .section {
+            margin-bottom: 40px;
+        }
+
+        .section-title {
+            font-size: 1.5em;
+            color: #2c3e50;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border-left: 4px solid #3498db;
+            padding-left: 10px;
+        }
+
+        .section-title::before {
+            content: "🔒";
+        }
+
+        .table-container {
+            overflow-x: auto;
+            background: #f9f9f9;
+            border-radius: 8px;
+            padding: 0;
+            border: 1px solid #ddd;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+        }
+
+        thead {
+            background: #2c3e50;
+            color: white;
+            position: sticky;
+            top: 0;
+        }
+
+        th {
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            border-right: 1px solid #ecf0f1;
+        }
+
+        th:last-child {
+            border-right: none;
+        }
+
+        td {
+            padding: 12px 15px;
+            border-bottom: 1px solid #ecf0f1;
+        }
+
+        tr:hover {
+            background-color: #f5f7fa;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: bold;
+        }
+
+        .badge.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .badge.failed {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .badge.warning {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+
+        .ip-cell {
+            font-family: monospace;
+            background: #f0f0f0;
+            padding: 4px 8px;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
+
+        .device-cell {
+            font-size: 0.85em;
+            color: #666;
+            max-width: 200px;
+            word-break: break-word;
+        }
+
+        .time-cell {
+            font-size: 0.9em;
+            color: #555;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #7f8c8d;
+        }
+
+        .empty-state-icon {
+            font-size: 3em;
+            margin-bottom: 15px;
+            opacity: 0.5;
+        }
+
+        .pagination {
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+
+        .pagination button {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background: white;
+            color: #2c3e50;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .pagination button:hover {
+            background: #2c3e50;
+            color: white;
+            border-color: #2c3e50;
+        }
+
+        .pagination button.active {
+            background: #2c3e50;
+            color: white;
+            border-color: #2c3e50;
+        }
+
+        .pagination button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .alert {
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 4px;
+            border-left: 4px solid;
+        }
+
+        .alert.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border-color: #bee5eb;
+        }
+
+        .alert.warning {
+            background: #fff3cd;
+            color: #856404;
+            border-color: #ffeaa7;
+        }
+
+        .btn-back {
+            display: inline-block;
+            margin-bottom: 20px;
+            padding: 10px 20px;
+            background: #3498db;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            text-decoration: none;
+            transition: background 0.3s ease;
+        }
+
+        .btn-back:hover {
+            background: #2980b9;
+        }
+
+        .last-login-info {
+            background: #ecf0f1;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            border-left: 4px solid #27ae60;
+        }
+
+        .last-login-info h3 {
+            margin: 0 0 10px 0;
+            color: #27ae60;
+        }
+
+        .last-login-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+        }
+
+        .detail-item {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .detail-label {
+            font-size: 0.85em;
+            color: #7f8c8d;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .detail-value {
+            font-size: 1em;
+            color: #2c3e50;
+            margin-top: 5px;
+            word-break: break-all;
+            font-family: monospace;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #7f8c8d;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        @media (max-width: 768px) {
+            .dashboard-container {
+                padding: 15px;
+            }
+
+            .dashboard-header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 15px;
+            }
+
+            .stats-container {
+                grid-template-columns: 1fr;
+            }
+
+            table {
+                font-size: 0.9em;
+            }
+
+            th, td {
+                padding: 8px;
+            }
+
+            .last-login-details {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <button class="btn-back" onclick="window.location.href='/home'">← Back to Notes</button>
+
+    <div class="dashboard-container">
+        <div class="dashboard-header">
+            <h1>🔐 Security Dashboard</h1>
+            <div class="user-info">
+                <span>📧 {{ user.email }}</span>
+                <span id="status-badge">Loading...</span>
+            </div>
+        </div>
+
+        <!-- Security Summary Stats -->
+        <div class="stats-container">
+            <div class="stat-card success">
+                <span class="stat-label">Total Logins</span>
+                <span class="stat-value" id="total-logins">-</span>
+            </div>
+            <div class="stat-card warning">
+                <span class="stat-label">Failed (24h)</span>
+                <span class="stat-value" id="failed-logins">-</span>
+            </div>
+            <div class="stat-card info">
+                <span class="stat-label">Last Login</span>
+                <span class="stat-value" id="last-login-time" style="font-size: 1.5em;">-</span>
+            </div>
+        </div>
+
+        <!-- Last Login Details -->
+        <div id="last-login-section" class="last-login-info" style="display: none;">
+            <h3>📍 Last Successful Login</h3>
+            <div class="last-login-details">
+                <div class="detail-item">
+                    <span class="detail-label">IP Address</span>
+                    <span class="detail-value" id="last-login-ip">-</span>
+                </div>
+                <div class="detail-item">
+                    <span class="detail-label">Device / Browser</span>
+                    <span class="detail-value" id="last-login-device">-</span>
+                </div>
+                <div class="detail-item">
+                    <span class="detail-label">Account Status</span>
+                    <span class="detail-value" id="account-status">-</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Login Activity Section -->
+        <div class="section">
+            <h2 class="section-title">Login Activity</h2>
+            <div id="activity-loading" class="loading">
+                <div class="spinner"></div>
+                <p>Loading activity...</p>
+            </div>
+            <div id="activity-section" style="display: none;">
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date & Time</th>
+                                <th>IP Address</th>
+                                <th>Device / Browser</th>
+                                <th>Action</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="activity-table-body">
+                            <!-- Populated by JavaScript -->
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination" id="pagination"></div>
+            </div>
+            <div id="activity-empty" class="empty-state" style="display: none;">
+                <div class="empty-state-icon">📭</div>
+                <p>No login activity recorded yet</p>
+            </div>
+        </div>
+
+        <!-- Security Tips -->
+        <div class="section">
+            <h2 class="section-title" style="padding-left: 10px;">💡 Security Tips</h2>
+            <div class="alert info">
+                <strong>Recognize unfamiliar IPs or devices?</strong> Your account may have been compromised. Change your password immediately and contact support.
+            </div>
+            <div class="alert info">
+                <strong>Enable 2FA:</strong> Use Google Authenticator or backup PIN codes to secure your account further.
+            </div>
+            <div class="alert info">
+                <strong>Review regularly:</strong> Check your login activity weekly to spot unauthorized access early.
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentPage = 0;
+        const itemsPerPage = 15;
+
+        async function loadSummary() {
+            try {
+                const resp = await fetch('/dashboard/summary');
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+
+                // Update stats
+                document.getElementById('total-logins').textContent = data.total_logins;
+                document.getElementById('failed-logins').textContent = data.failed_logins_24h;
+
+                // Format last login time
+                if (data.last_login_time) {
+                    const date = new Date(data.last_login_time);
+                    const formatter = new Intl.DateTimeFormat('en-US', {
+                        month: 'short',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    });
+                    document.getElementById('last-login-time').textContent = formatter.format(date);
+
+                    // Show last login details
+                    document.getElementById('last-login-ip').textContent = data.last_login_ip || 'N/A';
+                    document.getElementById('last-login-device').textContent = data.last_login_device || 'N/A';
+                    document.getElementById('account-status').textContent = data.status.toUpperCase();
+                    document.getElementById('last-login-section').style.display = 'block';
+                } else {
+                    document.getElementById('last-login-time').textContent = 'Never';
+                }
+
+                // Update status badge
+                const statusBadge = document.getElementById('status-badge');
+                if (data.status === 'active') {
+                    statusBadge.className = 'badge success';
+                    statusBadge.textContent = '✓ Active';
+                } else if (data.status === 'banned') {
+                    statusBadge.className = 'badge failed';
+                    statusBadge.textContent = '✗ Banned';
+                } else {
+                    statusBadge.className = 'badge warning';
+                    statusBadge.textContent = '⚠ ' + data.status;
+                }
+            } catch (err) {
+                console.error('Error loading summary:', err);
+            }
+        }
+
+        async function loadActivity(page = 0) {
+            try {
+                const offset = page * itemsPerPage;
+                const resp = await fetch(`/dashboard/activity?limit=${itemsPerPage}&offset=${offset}`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+
+                document.getElementById('activity-loading').style.display = 'none';
+
+                if (data.activities.length === 0 && page === 0) {
+                    document.getElementById('activity-empty').style.display = 'block';
+                    document.getElementById('activity-section').style.display = 'none';
+                    return;
+                }
+
+                // Populate table
+                const tbody = document.getElementById('activity-table-body');
+                tbody.innerHTML = '';
+
+                data.activities.forEach(act => {
+                    const row = document.createElement('tr');
+                    const date = new Date(act.login_time);
+                    const formatter = new Intl.DateTimeFormat('en-US', {
+                        month: 'short',
+                        day: 'numeric',
+                        year: '2-digit',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit'
+                    });
+                    const timeStr = formatter.format(date);
+
+                    const statusBadge = act.success
+                        ? '<span class="badge success">✓ Success</span>'
+                        : '<span class="badge failed">✗ Failed</span>';
+
+                    row.innerHTML = `
+                        <td class="time-cell">${timeStr}</td>
+                        <td class="ip-cell">${act.ip_address || 'N/A'}</td>
+                        <td class="device-cell">${act.device_info || 'Unknown'}</td>
+                        <td>${act.action || 'login'}</td>
+                        <td>${statusBadge}</td>
+                    `;
+                    tbody.appendChild(row);
+                });
+
+                document.getElementById('activity-section').style.display = 'block';
+                document.getElementById('activity-empty').style.display = 'none';
+
+                // Pagination
+                const totalPages = Math.ceil(data.total / itemsPerPage);
+                updatePagination(totalPages, page);
+                currentPage = page;
+            } catch (err) {
+                console.error('Error loading activity:', err);
+                document.getElementById('activity-loading').innerHTML = '<p style="color: #c0392b;">Error loading activity</p>';
+            }
+        }
+
+        function updatePagination(totalPages, currentPageNum) {
+            const paginationDiv = document.getElementById('pagination');
+            paginationDiv.innerHTML = '';
+
+            if (totalPages <= 1) return;
+
+            // Previous button
+            const prevBtn = document.createElement('button');
+            prevBtn.textContent = '← Previous';
+            prevBtn.disabled = currentPageNum === 0;
+            prevBtn.onclick = () => loadActivity(currentPageNum - 1);
+            paginationDiv.appendChild(prevBtn);
+
+            // Page numbers
+            for (let i = 0; i < totalPages; i++) {
+                const btn = document.createElement('button');
+                btn.textContent = i + 1;
+                if (i === currentPageNum) btn.classList.add('active');
+                btn.onclick = () => loadActivity(i);
+                paginationDiv.appendChild(btn);
+            }
+
+            // Next button
+            const nextBtn = document.createElement('button');
+            nextBtn.textContent = 'Next →';
+            nextBtn.disabled = currentPageNum === totalPages - 1;
+            nextBtn.onclick = () => loadActivity(currentPageNum + 1);
+            paginationDiv.appendChild(nextBtn);
+        }
+
+        // Load on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            loadSummary();
+            loadActivity(0);
+        });
+    </script>
+</body>
+
+</html>
