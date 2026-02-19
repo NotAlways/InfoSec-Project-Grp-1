@@ -18,7 +18,16 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from passlib.context import CryptContext
 from itsdangerous import URLSafeTimedSerializer
-from backend.crypto import load_key, encrypt_content, decrypt_content, generate_key, wrap_key, unwrap_key
+from backend.crypto import (
+    load_key,
+    encrypt_content,
+    decrypt_content,
+    generate_key,
+    save_key,
+    key_exists,
+    wrap_key,
+    unwrap_key,
+)
 from backend.activity import init_migration, log_activity
 from backend.anomaly import check_anomaly
 from fastapi import Cookie
@@ -1549,6 +1558,17 @@ async def finalize_signup(
     )
     
     db.add(new_user)
+
+    # Ensure master encryption key exists; generate and save automatically on first user creation
+    try:
+        if not key_exists():
+            master_key = generate_key()
+            save_key(master_key)
+            print("DEBUG: Generated master encryption key during user signup")
+    except Exception as e:
+        # Log error but do not block user creation -- administrators should investigate
+        print(f"CRITICAL: Failed to generate/save master encryption key: {e}")
+
     await db.execute(delete(PendingAction).where(PendingAction.email == email))
     await db.commit()
     
