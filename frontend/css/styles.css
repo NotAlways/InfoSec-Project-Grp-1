@@ -198,3 +198,312 @@ button:hover {
 }
 
 /* ✅ END Watermark */
+
+.sig-badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: default;
+  margin-left: 8px;
+  vertical-align: middle;
+  letter-spacing: 0.02em;
+  transition: background 0.2s, color 0.2s;
+}
+
+/* State: note has not been signed */
+.sig-badge.sig-none {
+  background: #ecf0f1;
+  color: #7f8c8d;
+  border: 1px solid #bdc3c7;
+}
+
+/* State: signed but not yet verified this session */
+.sig-badge.sig-pending {
+  background: #fef9e7;
+  color: #d68910;
+  border: 1px solid #f0b429;
+  cursor: pointer;
+}
+.sig-badge.sig-pending:hover {
+  background: #fdebd0;
+}
+
+/* State: signature verified successfully */
+.sig-badge.sig-verified {
+  background: #eafaf1;
+  color: #1e8449;
+  border: 1px solid #27ae60;
+}
+
+/* State: signature invalid / tampered */
+.sig-badge.sig-invalid {
+  background: #fdf2f8;
+  color: #c0392b;
+  border: 1px solid #e74c3c;
+}
+
+.signing-panel {
+  margin: 20px 0;
+  padding: 16px 20px;
+  background: #f8f9fa;
+  border: 1px solid #dee2e6;
+  border-radius: 8px;
+}
+
+.signing-panel h4 {
+  margin: 0 0 12px;
+  color: #2c3e50;
+  font-size: 15px;
+}
+
+.signing-status {
+  display: none;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: 5px;
+  font-size: 13px;
+}
+.signing-status--success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+.signing-status--warn    { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+.signing-status--error   { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+
+#secureViewModal {
+  display: none;               /* shown by JS */
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 9999;
+  justify-content: center;
+  align-items: center;
+  padding: 20px;
+}
+
+.sv-modal-inner {
+  background: #fff;
+  border-radius: 10px;
+  max-width: 740px;
+  width: 100%;
+  max-height: 85vh;
+  overflow-y: auto;
+  padding: 28px 32px;
+  box-shadow: 0 20px 60px rgba(0,0,0,.25);
+  position: relative;
+}
+
+.sv-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.sv-title {
+  margin: 0;
+  font-size: 22px;
+  color: #2c3e50;
+  flex: 1 1 auto;
+}
+
+.sv-meta {
+  font-size: 12px;
+  color: #7f8c8d;
+  margin-bottom: 16px;
+}
+
+.sv-content {
+  white-space: pre-wrap;
+  font-size: 15px;
+  color: #333;
+  line-height: 1.7;
+  border-top: 1px solid #eee;
+  padding-top: 14px;
+  margin-bottom: 16px;
+}
+
+/* Zero-knowledge notice banner */
+.sv-zk-notice {
+  background: #eaf4fb;
+  border: 1px solid #aed6f1;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 12px;
+  color: #1a5276;
+  margin-bottom: 16px;
+}
+
+.sv-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.btn-download {
+  background: #2c3e50;
+  color: white;
+  border: none;
+  padding: 9px 16px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.btn-download:hover { background: #1a252f; }
+
+.btn-close-sv {
+  background: #ecf0f1;
+  color: #2c3e50;
+  border: 1px solid #bdc3c7;
+  padding: 9px 16px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.btn-close-sv:hover { background: #d5dbdb; }
+
+.sv-loading {
+  text-align: center;
+  padding: 40px 0;
+  color: #555;
+  font-size: 15px;
+}
+
+.sv-spinner {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border: 3px solid #bdc3c7;
+  border-top-color: #2c3e50;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+
+.sv-error {
+  color: #c0392b;
+  text-align: center;
+  padding: 20px 0;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+#uploadStatus {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: 5px;
+  font-size: 13px;
+  display: none;
+}
+
+.upload-status--ok  { display: block !important; background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+.upload-status--err { display: block !important; background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+
+#uploadProgress {
+  display: none;
+  height: 4px;
+  background: #2c3e50;
+  border-radius: 2px;
+  margin-top: 8px;
+  animation: pulse-bg 1s ease-in-out infinite;
+}
+
+@keyframes pulse-bg {
+  0%,100% { opacity: 1; }
+  50%      { opacity: 0.4; }
+}
+
+/* File list cards */
+.file-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border: 1px solid #ddd;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  background: #fdfdfd;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.file-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.file-name {
+  font-weight: 600;
+  color: #2c3e50;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 400px;
+}
+
+.file-meta {
+  font-size: 12px;
+  color: #888;
+}
+
+.file-integrity {
+  font-size: 11px;
+  color: #555;
+  font-family: monospace;
+  background: #f0f4f8;
+  padding: 2px 6px;
+  border-radius: 4px;
+  width: fit-content;
+}
+
+.file-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.btn-dl {
+  background: #27ae60;
+  color: white;
+  border: none;
+  padding: 7px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.btn-dl:hover { background: #1e8449; }
+
+.btn-del-file {
+  background: #e74c3c;
+  color: white;
+  border: none;
+  padding: 7px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.btn-del-file:hover { background: #c0392b; }
+
+.no-files {
+  color: #7f8c8d;
+  font-style: italic;
+  text-align: center;
+  padding: 20px 0;
+}
+
+.file-error {
+  color: #c0392b;
+  font-size: 13px;
+}
+
+/* File upload type hint */
+.file-type-hint {
+  font-size: 11px;
+  color: #888;
+  margin-top: 4px;
+}

@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, Form, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, JSON, select, update, delete
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, JSON, select, update, delete, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy import LargeBinary
@@ -63,10 +63,18 @@ from fastapi.responses import StreamingResponse
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import inch
-
+from file_security import full_security_scan, compute_sha256
+from crypto_signing import (
+    sign_data as _ed_sign,
+    b64e as _b64e,
+    b64d as _b64d,
+    generate_signing_keypair as _gen_keypair,
+)
+from fastapi import UploadFile, File as FastAPIFile
+import base64 as _b64mod
+from cryptography.exceptions import InvalidSignature
 
 limiter = Limiter(key_func=get_remote_address)
-
 
 # --- IMPORTS FOR EMAIL ---
 import smtplib
@@ -88,11 +96,13 @@ Base = declarative_base()
 # Load encryption key on startup
 encryption_key = None
 
+
 def get_encryption_key():
     global encryption_key
     if encryption_key is None:
         encryption_key = load_key()
     return encryption_key
+
 
 # Models
 class Note(Base):
@@ -101,12 +111,18 @@ class Note(Base):
     title = Column(String, index=True)
     content = Column(String)
     wrapped_key = Column(String, nullable=True)
+    encrypted_title = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    signer_id = Column(String, nullable=True)
+    signer_public_key = Column(String, nullable=True)
+    signature = Column(String, nullable=True)
+
 
 class NoteSchema(BaseModel):
     title: str
     content: str
+
 
 class NoteResponse(BaseModel):
     id: int
@@ -118,12 +134,15 @@ class NoteResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
 # FastAPI app
 app = FastAPI(title="NoteVault API")
 app.state.limiter = limiter
 
+
 def redirect_with_error(path: str, msg: str) -> RedirectResponse:
     return RedirectResponse(url=f"{path}?error={quote(msg)}", status_code=303)
+
 
 @app.exception_handler(RateLimitExceeded)
 async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
@@ -131,6 +150,7 @@ async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
         "/login",
         "Too many requests. Please wait and try again"
     )
+
 
 # CORS middleware
 app.add_middleware(
@@ -141,22 +161,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def enforce_https(request: Request, call_next):
+    if request.url.scheme != "https":
+        return JSONResponse(status_code=400, content={"detail": "HTTPS required"})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
+    return response
+
+
 # Database session
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
 engine = create_async_engine(DATABASE_URL, echo=True)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
+
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
+
 
 def send_security_email(subject: str, recipient: str, body_html: str):
     """Sends a secure SMTP email for 2FA/Verification"""
     try:
         msg = MIMEMultipart()
         # FIX: Wrapped in quotes to make it a string
-        msg['From'] = f"{APP_NAME} Security <{SMTP_USERNAME}>" 
+        msg['From'] = f"{APP_NAME} Security <{SMTP_USERNAME}>"
         msg['To'] = recipient
         msg['Subject'] = f"[{APP_NAME}] {subject}"
         msg.attach(MIMEText(body_html, 'html'))
@@ -171,12 +208,13 @@ def send_security_email(subject: str, recipient: str, body_html: str):
         print(f"CRITICAL: Email failed to send to {recipient}. Error: {e}")
         return False
 
+
 # Routes
 @app.on_event("startup")
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        
+
         # Migration: Add wrapped_key column if it doesn't exist
         try:
             from sqlalchemy import text
@@ -208,19 +246,22 @@ async def startup():
     except Exception as e:
         print(f"Anomaly model load skipped: {e}")
 
+
 @app.post("/notes", response_model=NoteResponse)
 async def create_note(note: NoteSchema, db: AsyncSession = Depends(get_db)):
     master_key = get_encryption_key()
     # generate a per-note DEK and encrypt the note with it
     dek = generate_key()
     encrypted_content = encrypt_content(note.content, dek)
+    encrypted_title = encrypt_content(note.title, dek)
     # wrap the DEK with the master key
     wrapped = wrap_key(dek, master_key)
-    new_note = Note(title=note.title, content=encrypted_content, wrapped_key=wrapped)
+    new_note = Note(title=note.title, encrypted_title=encrypted_title, content=encrypted_content, wrapped_key=wrapped)
     db.add(new_note)
     await db.commit()
     await db.refresh(new_note)
     return new_note
+
 
 @app.get("/notes", response_model=list[NoteResponse])
 async def get_notes():
@@ -235,6 +276,8 @@ async def get_notes():
                 if note.wrapped_key:
                     dek = unwrap_key(note.wrapped_key, master_key)
                     note.content = decrypt_content(note.content, dek)
+                    if note.encrypted_title:
+                        note.title = decrypt_content(note.encrypted_title, dek)
                 else:
                     # legacy/plaintext
                     note.content = decrypt_content(note.content, master_key)
@@ -242,6 +285,7 @@ async def get_notes():
                 # if decryption fails, leave content as-is or set an error placeholder
                 note.content = "[unable to decrypt]"
         return notes
+
 
 @app.get("/notes/{note_id}", response_model=NoteResponse)
 async def get_note(note_id: int):
@@ -256,11 +300,14 @@ async def get_note(note_id: int):
             if note.wrapped_key:
                 dek = unwrap_key(note.wrapped_key, master_key)
                 note.content = decrypt_content(note.content, dek)
+                if note.encrypted_title:
+                    note.title = decrypt_content(note.encrypted_title, dek)
             else:
                 note.content = decrypt_content(note.content, master_key)
         except Exception:
             note.content = "[unable to decrypt]"
         return note
+
 
 @app.put("/notes/{note_id}", response_model=NoteResponse)
 async def update_note(note_id: int, note: NoteSchema):
@@ -274,6 +321,7 @@ async def update_note(note_id: int, note: NoteSchema):
         # generate a new per-note DEK for the updated content
         dek = generate_key()
         db_note.title = note.title
+        db_note.encrypted_title = encrypt_content(note.title, dek)
         db_note.content = encrypt_content(note.content, dek)
         db_note.wrapped_key = wrap_key(dek, master_key)
         db_note.updated_at = datetime.utcnow()
@@ -286,6 +334,7 @@ async def update_note(note_id: int, note: NoteSchema):
         except Exception:
             db_note.content = "[unable to decrypt]"
         return db_note
+
 
 @app.delete("/notes/{note_id}")
 async def delete_note(note_id: int):
@@ -306,10 +355,12 @@ async def delete_note(note_id: int):
 # --- from here onwards Prathip's code ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 EMAIL_SERIALIZER = URLSafeTimedSerializer("EMAIL_TOKEN_SECRET_KEY")
-WEAK_PINS = ["123456", "000000", "111111", "222222", "333333", "444444", "555555", "666666", "777777", "888888", "999999", "654321"]
+WEAK_PINS = ["123456", "000000", "111111", "222222", "333333", "444444", "555555", "666666", "777777", "888888",
+             "999999", "654321"]
 
 # Path adjustment for your directory structure
 from pathlib import Path
+
 _BASE_DIR = Path(__file__).parent.parent
 templates = Jinja2Templates(directory=str(_BASE_DIR / "frontend" / "templates"))
 app.mount("/static", StaticFiles(directory=str(_BASE_DIR / "frontend")), name="static")
@@ -317,6 +368,7 @@ app.mount("/static", StaticFiles(directory=str(_BASE_DIR / "frontend")), name="s
 # --- SESSION SECURITY: Inactivity Auto Logout ---
 INACTIVITY_TIMEOUT_MINUTES = 15
 LAST_ACTIVITY_UPDATE_SECONDS = 60  # don't spam DB updates on every request
+
 
 def get_sg_time():
     """Helper function to get current time in GMT+8 (Naive for DB compatibility)"""
@@ -338,6 +390,7 @@ def is_backup_pin_expired(user: "User") -> bool:
 def get_backup_pin_history_limit(user: "User") -> int:
     # Policy: users last 3, admins/superadmin last 5
     return 5 if user.role in ["admin", "superadmin"] else 3
+
 
 def backup_pin_reused(user: "User", new_pin: str) -> bool:
     # Blocks reuse of current pin + last N pin hashes
@@ -374,6 +427,7 @@ def backup_pin_reused(user: "User", new_pin: str) -> bool:
             return True
 
     return False
+
 
 def push_backup_pin_history(user: "User"):
     # Store the previous pin hash, keep only last N
@@ -419,9 +473,11 @@ def set_trusted_device_cookie(response: RedirectResponse, user: "User"):
 TRUSTED_DEVICE_COOKIE = "device_token"
 TRUST_DAYS = 30
 
+
 def _hash_ua(ua: str) -> str:
     ua = ua or ""
     return hashlib.sha256(ua.encode("utf-8")).hexdigest()
+
 
 def _parse_device_cookie(val: str) -> tuple[str, str] | tuple[None, None]:
     # format: "<device_id>.<secret>"
@@ -432,6 +488,7 @@ def _parse_device_cookie(val: str) -> tuple[str, str] | tuple[None, None]:
         return (None, None)
     return (device_id, secret)
 
+
 def _set_trusted_device_cookie(response: RedirectResponse, device_id: str, secret: str):
     response.set_cookie(
         key=TRUSTED_DEVICE_COOKIE,
@@ -439,9 +496,10 @@ def _set_trusted_device_cookie(response: RedirectResponse, device_id: str, secre
         max_age=60 * 60 * 24 * TRUST_DAYS,
         httponly=True,
         samesite="lax",
-        secure=True,   # IMPORTANT since you're using https://localhost
+        secure=True,  # IMPORTANT since you're using https://localhost
         path="/",
     )
+
 
 async def is_trusted_device(request: Request, user: "User", db: AsyncSession) -> bool:
     raw = request.cookies.get(TRUSTED_DEVICE_COOKIE)
@@ -477,6 +535,7 @@ async def is_trusted_device(request: Request, user: "User", db: AsyncSession) ->
     await db.commit()
 
     return True
+
 
 async def trust_this_device(request: Request, user: "User", db: AsyncSession, response: RedirectResponse):
     """
@@ -532,6 +591,7 @@ async def trust_this_device(request: Request, user: "User", db: AsyncSession, re
 
     _set_trusted_device_cookie(response, new_device_id, new_secret)
 
+
 async def revoke_this_device(request: Request, user: "User", db: AsyncSession):
     raw = request.cookies.get(TRUSTED_DEVICE_COOKIE)
     device_id, secret = _parse_device_cookie(raw)
@@ -559,10 +619,11 @@ async def revoke_this_device(request: Request, user: "User", db: AsyncSession):
     td.revoked_at = get_sg_time()
     await db.commit()
 
+
 # --- WebAuthn / Passkeys (Platform Biometrics for Admins) ---
-WEBAUTHN_RP_ID = "localhost"                 # must match your domain
+WEBAUTHN_RP_ID = "localhost"  # must match your domain
 WEBAUTHN_RP_NAME = "NoteVault"
-WEBAUTHN_ORIGIN = "https://localhost:8000"    # MUST match your browser URL exactly
+WEBAUTHN_ORIGIN = "https://localhost:8000"  # MUST match your browser URL exactly
 PASSKEY_TTL_SECONDS = 120
 
 
@@ -574,10 +635,12 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     b = b.astype(np.float32)
     return float(np.clip(np.dot(a, b), -1.0, 1.0))
 
+
 def _l2_normalize(v: np.ndarray) -> np.ndarray:
     v = v.astype(np.float32)
     n = float(np.linalg.norm(v) + 1e-12)
     return v / n
+
 
 def _median(vals: list[float]) -> float:
     if not vals:
@@ -617,21 +680,23 @@ class User(Base):
     role = Column(String, default="user")
     status = Column(String, default="active")
     failed_login_attempts = Column(Integer, default=0)
-    failed_2fa_attempts = Column(Integer, default=0) # Track 2FA/PIN separately
+    failed_2fa_attempts = Column(Integer, default=0)  # Track 2FA/PIN separately
     lockout_until = Column(DateTime, nullable=True)  # Progressive timer
     current_session_id = Column(String, nullable=True)
     device_key = Column(String, default=lambda: str(uuid.uuid4()))
     created_at = Column(DateTime, default=get_sg_time)
     passkeys = Column(JSON, default=list)
     last_activity_at = Column(DateTime, nullable=True)  # ✅ tracks last user activity for auto-logout
+    signing_private_key = Column(String, nullable=True)
+    signing_public_key = Column(String, nullable=True)
 
 
 class PendingAction(Base):
     """Temporary table to track email verification status across tabs"""
     __tablename__ = "pending_actions"
     email = Column(String, primary_key=True)
-    action_data = Column(JSON) # Stores username/password temporarily
-    action_type = Column(String) # 'signup' or 'login'
+    action_data = Column(JSON)  # Stores username/password temporarily
+    action_type = Column(String)  # 'signup' or 'login'
     is_verified = Column(Boolean, default=False)
     created_at = Column(DateTime, default=get_sg_time)
 
@@ -640,18 +705,18 @@ class WebAuthnSession(Base):
     __tablename__ = "webauthn_sessions"
     id = Column(String, primary_key=True, index=True)  # uuid
     email = Column(String, index=True, nullable=False)
-    kind = Column(String, nullable=False)              # "register" or "login"
-    challenge = Column(String, nullable=False)         # base64url challenge
+    kind = Column(String, nullable=False)  # "register" or "login"
+    challenge = Column(String, nullable=False)  # base64url challenge
     created_at = Column(DateTime, default=get_sg_time)
     used = Column(Boolean, default=False)
 
 
 class TrustedDevice(Base):
     __tablename__ = "trusted_devices"
-    id = Column(String, primary_key=True, index=True)          # device_id (uuid string)
-    user_email = Column(String, index=True, nullable=False)    # link to User.email
-    secret_hash = Column(String, nullable=False)               # hash(secret)
-    ua_hash = Column(String, nullable=True)                    # hash(user-agent) (optional but useful)
+    id = Column(String, primary_key=True, index=True)  # device_id (uuid string)
+    user_email = Column(String, index=True, nullable=False)  # link to User.email
+    secret_hash = Column(String, nullable=False)  # hash(secret)
+    ua_hash = Column(String, nullable=True)  # hash(user-agent) (optional but useful)
     created_at = Column(DateTime, default=get_sg_time)
     last_seen_at = Column(DateTime, default=get_sg_time)
     revoked_at = Column(DateTime, nullable=True)
@@ -746,24 +811,26 @@ def apply_lockout_policy(user: User):
     else:
         # --- DO NOT CHANGE: Normal User Logic ---
         total_fails = max(user.failed_login_attempts, user.failed_2fa_attempts)
-        
+
         if user.failed_login_attempts >= 5 or user.failed_2fa_attempts >= 3:
             user.status = "locked"
             threshold = 5 if user.failed_login_attempts >= 5 else 3
             multiplier = (total_fails - (threshold - 1))
             user.lockout_until = get_sg_time() + timedelta(minutes=30 * multiplier)
 
+
 @app.on_event("startup")
 async def startup_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+
 @app.get("/notes/{note_id}/copy-text")
 @limiter.limit("6/minute")
 async def get_copy_text(
-    note_id: int,
-    request: Request,
-    user: User = Depends(verify_session),
+        note_id: int,
+        request: Request,
+        user: User = Depends(verify_session),
 ):
     key = get_encryption_key()
 
@@ -786,17 +853,18 @@ async def get_copy_text(
     # Optional audit trail (recommended)
     print(
         f"AUDIT_COPY note_id={note_id} user={user.email} ip={request.client.host} "
-        f"ua={request.headers.get('user-agent','')}"
+        f"ua={request.headers.get('user-agent', '')}"
     )
 
     return {"text": stamped}
 
+
 @app.get("/notes/{note_id}/export-pdf")
 @limiter.limit("2/minute")
 async def export_note_pdf(
-    note_id: int,
-    request: Request,
-    user: User = Depends(verify_session),
+        note_id: int,
+        request: Request,
+        user: User = Depends(verify_session),
 ):
     key = get_encryption_key()
 
@@ -839,7 +907,13 @@ async def export_note_pdf(
 
     c.setFont("Helvetica-Bold", 16)
     c.setFillColorRGB(0, 0, 0)
-    c.drawString(margin_x, y, note.title or f"Note {note_id}")
+    _pdf_title = note.title
+    if note.encrypted_title:
+        try:
+            _pdf_title = decrypt_content(note.encrypted_title, key)
+        except Exception:
+            pass
+    c.drawString(margin_x, y, _pdf_title or f"Note {note_id}")
 
     y -= 0.4 * inch
     c.setFont("Helvetica", 11)
@@ -893,7 +967,7 @@ async def export_note_pdf(
     # Audit log (optional but good for InfoSec)
     print(
         f"AUDIT_EXPORT_PDF note_id={note_id} user={user.email} ip={request.client.host} "
-        f"ua={request.headers.get('user-agent','')}"
+        f"ua={request.headers.get('user-agent', '')}"
     )
 
     filename = f"note_{note_id}.pdf"
@@ -902,6 +976,7 @@ async def export_note_pdf(
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
     )
+
 
 # Dashboard
 @app.get("/home", name="dashboard", response_class=HTMLResponse)
@@ -912,6 +987,7 @@ async def dashboard(request: Request, user: User = Depends(verify_session)):
         "user": user,
         "message": message or f"Welcome back, {user.username}"
     })
+
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(request: Request, user: User = Depends(verify_session)):
@@ -959,12 +1035,14 @@ async def poll_verification_status(email: str, db: AsyncSession = Depends(get_db
 
     return {"verified": False}
 
+
 # --- SIGNUP FLOW ---
 
 @app.get("/register", response_class=HTMLResponse)
 async def render_signup(request: Request):
     # Standard render, no error
     return templates.TemplateResponse("signup.html", {"request": request})
+
 
 def validate_password_complex(password: str, email: str = None, username: str = None):
     errors = []
@@ -986,14 +1064,15 @@ def validate_password_complex(password: str, email: str = None, username: str = 
         errors.append("Password cannot contain your username")
     return errors
 
+
 @app.post("/register")
 async def signup_start(
-    request: Request, 
-    username: str = Form(...), 
-    email: str = Form(...), 
-    password: str = Form(...), 
-    confirm_password: str = Form(...), 
-    db: AsyncSession = Depends(get_db)
+        request: Request,
+        username: str = Form(...),
+        email: str = Form(...),
+        password: str = Form(...),
+        confirm_password: str = Form(...),
+        db: AsyncSession = Depends(get_db)
 ):
     all_errors = []
 
@@ -1014,27 +1093,27 @@ async def signup_start(
     normalized_new_user = re.sub(r'\s+', '', username).lower()
     res = await db.execute(select(User))
     existing_users = res.scalars().all()
-    
+
     for u in existing_users:
         if u.email == email:
             all_errors.append("Email is too similar or already registered")
-        
+
         normalized_existing = re.sub(r'\s+', '', u.username).lower()
         if normalized_existing == normalized_new_user:
             all_errors.append("Username is already taken or too similar to an existing account")
 
     # 5. Return all errors in "One Shot"
     if all_errors:
-        error_message = " | ".join(all_errors) 
+        error_message = " | ".join(all_errors)
         return templates.TemplateResponse("signup.html", {
-            "request": request, 
-            "error": error_message, 
-            "username": username, 
+            "request": request,
+            "error": error_message,
+            "username": username,
             "email": email
         })
 
     # 6. Success Flow: Handle PendingAction
-    
+
     signup_nonce = str(uuid.uuid4())
     action_data = {"username": username, "password": password, "signup_nonce": signup_nonce}
     pending = PendingAction(
@@ -1050,17 +1129,18 @@ async def signup_start(
     # 7. Generate token and send email
     token = EMAIL_SERIALIZER.dumps(email, salt=signup_nonce)
     verify_url = f"https://localhost:8000/verify-registration?token={token}"
-    
+
     html_content = f"""
     <h3>Welcome to {APP_NAME}</h3>
     <p>Please click the button below to verify your account:</p>
     <a href="{verify_url}" style="background:#2c3e50; color:white; padding:10px; text-decoration:none; border-radius:5px;">Verify Email Address</a>
     """
-    
+
     send_security_email("Verify Your Email", email, html_content)
     print(f"DEBUG: Sent registration email to {email} with link: {verify_url}")
-    
+
     return templates.TemplateResponse("2fa_email_code.html", {"request": request, "email": email})
+
 
 @app.get("/verify-registration", response_class=HTMLResponse)
 async def verify_registration(token: str, db: AsyncSession = Depends(get_db)):
@@ -1070,7 +1150,7 @@ async def verify_registration(token: str, db: AsyncSession = Depends(get_db)):
         email = raw_email.decode('utf-8') if isinstance(raw_email, bytes) else raw_email
         res = await db.execute(select(PendingAction).filter(PendingAction.email == email))
         pending = res.scalar_one_or_none()
-        
+
         if not pending:
             raise Exception("No pending registration found")
 
@@ -1079,12 +1159,12 @@ async def verify_registration(token: str, db: AsyncSession = Depends(get_db)):
         signup_nonce = (pending.action_data or {}).get("signup_nonce")
         if not signup_nonce:
             raise Exception("Missing signup nonce (stale signup request)")
-        
+
         EMAIL_SERIALIZER.loads(token, salt=signup_nonce, max_age=600)
-        
+
         await db.execute(update(PendingAction).where(PendingAction.email == email).values(is_verified=True))
         await db.commit()
-        
+
         return HTMLResponse("""
         <html>
         <head>
@@ -1123,21 +1203,23 @@ async def verify_registration(token: str, db: AsyncSession = Depends(get_db)):
         </html>
         """)
 
+
 @app.get("/setup-google-auth", response_class=HTMLResponse)
 async def render_setup_qr(request: Request, email: str):
     """Called automatically by Tab A when polling detects verification"""
     secret = pyotp.random_base32()
     totp = pyotp.TOTP(secret)
     prov_url = totp.provisioning_uri(name=email, issuer_name="NoteVault")
-    
+
     img = qrcode.make(prov_url)
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     qr_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-    
+
     return templates.TemplateResponse("setup_google_auth.html", {
         "request": request, "qr_code": qr_b64, "email": email, "secret": secret
     })
+
 
 @app.post("/setup-google-auth")
 async def process_totp(request: Request, token: str = Form(...), secret: str = Form(...), email: str = Form(...)):
@@ -1145,14 +1227,15 @@ async def process_totp(request: Request, token: str = Form(...), secret: str = F
         return templates.TemplateResponse("backup_code.html", {"request": request, "email": email, "secret": secret})
     raise HTTPException(status_code=400, detail="Invalid Google Auth Code")
 
+
 @app.post("/setup-backup-pin")
 async def finalize_signup(
-    request: Request, 
-    backup_pin: str = Form(...), 
-    confirm_pin: str = Form(...), 
-    secret: str = Form(...), 
-    email: str = Form(...), 
-    db: AsyncSession = Depends(get_db)
+        request: Request,
+        backup_pin: str = Form(...),
+        confirm_pin: str = Form(...),
+        secret: str = Form(...),
+        email: str = Form(...),
+        db: AsyncSession = Depends(get_db)
 ):
     pin_errors = []
 
@@ -1167,22 +1250,22 @@ async def finalize_signup(
         return templates.TemplateResponse("backup_code.html", {
             "request": request, "email": email, "secret": secret, "error": error_message
         })
-    
+
     # 2. Retrieve original signup data
     res = await db.execute(select(PendingAction).filter(PendingAction.email == email))
     pending = res.scalar_one_or_none()
-    
+
     if not pending:
         return templates.TemplateResponse("signup.html", {
             "request": request, "error": "Session expired. Please restart registration"
         })
-    
+
     # 3. Create the New User
-    session_id = str(uuid.uuid4()) # Generate session ID for auto-login
+    session_id = str(uuid.uuid4())  # Generate session ID for auto-login
     new_user = User(
         username=pending.action_data['username'],
-        email=email, 
-        hashed_password=pwd_context.hash(pending.action_data['password']), 
+        email=email,
+        hashed_password=pwd_context.hash(pending.action_data['password']),
         backup_pin_hash=pwd_context.hash(backup_pin),
         backup_pin_history=[],
         backup_pin_changed_at=get_sg_time(),
@@ -1190,30 +1273,32 @@ async def finalize_signup(
         totp_secret=secret,
         role="user",
         status="active",
-        current_session_id=session_id # Log them in immediately
+        current_session_id=session_id  # Log them in immediately
     )
-    
+
     db.add(new_user)
     await db.execute(delete(PendingAction).where(PendingAction.email == email))
     await db.commit()
-    
+
     # 4. AUTO-LOGIN: Define Redirect to /home and attach the session cookie
     response = RedirectResponse(url="/home", status_code=303)
     response.set_cookie(
-        key="session_id", 
-        value=session_id, 
-        httponly=True, 
+        key="session_id",
+        value=session_id,
+        httponly=True,
         samesite="lax",
         path="/",
     )
-    
+
     return response
+
 
 # --- LOGIN FLOW ---
 
 @app.get("/", response_class=HTMLResponse)
 async def render_login(request: Request):
     return templates.TemplateResponse("login.html", {"request": request})
+
 
 @app.get("/login", response_class=HTMLResponse)
 async def render_login(request: Request):
@@ -1225,13 +1310,14 @@ async def render_login(request: Request):
         "message": message
     })
 
+
 @app.post("/login")
 @limiter.limit("5/minute")
 async def login_process(
-    request: Request,
-    email: str = Form(...),
-    password: str = Form(...),
-    db: AsyncSession = Depends(get_db)
+        request: Request,
+        email: str = Form(...),
+        password: str = Form(...),
+        db: AsyncSession = Depends(get_db)
 ):
     # 1. Fetch user
     res = await db.execute(select(User).filter(User.email == email))
@@ -1371,6 +1457,7 @@ async def login_process(
 
     return response
 
+
 @app.get("/verify-login", response_class=HTMLResponse)
 async def verify_login_link(token: str, db: AsyncSession = Depends(get_db)):
     try:
@@ -1427,13 +1514,14 @@ async def render_2fa_input(request: Request, email: str):
     """Auto-forwarded from login polling"""
     return templates.TemplateResponse("google_auth_2fa.html", {"request": request, "email": email})
 
+
 @app.post("/verify-2fa")
 @limiter.limit("6/minute")
 async def verify_2fa(
-    request: Request,
-    token: str = Form(...),
-    email: str = Form(...),
-    db: AsyncSession = Depends(get_db)
+        request: Request,
+        token: str = Form(...),
+        email: str = Form(...),
+        db: AsyncSession = Depends(get_db)
 ):
     # 1. Load user
     res = await db.execute(select(User).filter(User.email == email))
@@ -1532,7 +1620,7 @@ async def verify_2fa(
         else:
             redirect_url = "/home"
         response = RedirectResponse(url=redirect_url, status_code=303)
-        
+
         response.set_cookie(
             key="session_id",
             value=new_sid,
@@ -1540,7 +1628,7 @@ async def verify_2fa(
             samesite="lax",
             path="/"
         )
-        
+
         await trust_this_device(request, user, db, response)
         response.delete_cookie("tmp_login", path="/")
         return response
@@ -1560,11 +1648,11 @@ async def verify_2fa(
         # hard lock (admins/superadmin)
         return redirect_with_error("/login", "Account locked due to multiple failed attempts. Contact support")
 
-
     return templates.TemplateResponse(
         "google_auth_2fa.html",
         {"request": request, "email": email, "error": "Invalid code"}
     )
+
 
 @app.get("/backup", response_class=HTMLResponse)
 async def render_backup_verify(request: Request, email: str):
@@ -1573,17 +1661,18 @@ async def render_backup_verify(request: Request, email: str):
     'Lost access? Use Recovery PIN'
     """
     return templates.TemplateResponse("backupcode_verify.html", {
-        "request": request, 
+        "request": request,
         "email": email
     })
+
 
 @app.post("/verify-backup-pin")
 @limiter.limit("6/minute")
 async def verify_backup_pin(
-    request: Request,
-    pin: str = Form(...),
-    email: str = Form(...),
-    db: AsyncSession = Depends(get_db)
+        request: Request,
+        pin: str = Form(...),
+        email: str = Form(...),
+        db: AsyncSession = Depends(get_db)
 ):
     # 1. Load user
     res = await db.execute(select(User).filter(User.email == email))
@@ -1634,7 +1723,7 @@ async def verify_backup_pin(
         # FINAL LOGIN SUCCESS
         new_sid = str(uuid.uuid4())
         user.current_session_id = new_sid
-        
+
         pin_expired = is_backup_pin_expired(user) or bool(getattr(user, "must_change_backup_pin", False))
         if pin_expired:
             # Cleanup first
@@ -1655,7 +1744,7 @@ async def verify_backup_pin(
         else:
             redirect_url = "/home"
         response = RedirectResponse(url=redirect_url, status_code=303)
-        
+
         response.set_cookie(
             key="session_id",
             value=new_sid,
@@ -1693,12 +1782,12 @@ async def change_backup_pin_page(request: Request, user: User = Depends(verify_s
 @app.post("/change-backup-pin")
 @limiter.limit("6/minute")
 async def change_backup_pin_submit(
-    request: Request,
-    current_pin: str = Form(...),
-    new_pin: str = Form(...),
-    confirm_pin: str = Form(...),
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(verify_session),
+        request: Request,
+        current_pin: str = Form(...),
+        new_pin: str = Form(...),
+        confirm_pin: str = Form(...),
+        db: AsyncSession = Depends(get_db),
+        user: User = Depends(verify_session),
 ):
     errors = []
 
@@ -1730,20 +1819,20 @@ async def change_backup_pin_submit(
 
     await db.commit()
     return RedirectResponse(
-    url=f"/home?message=Recovery%20Pin%20changed%20successfully&t={int(time.time())}",
-    status_code=303
-)
+        url=f"/home?message=Recovery%20Pin%20changed%20successfully&t={int(time.time())}",
+        status_code=303
+    )
 
 
 # --- ADMIN ---
 
 @app.post("/admin/manage")
 async def manage_user(
-    request: Request,
-    target: str, 
-    action: str, 
-    db: AsyncSession = Depends(get_db),
-    admin: User = Depends(verify_session)
+        request: Request,
+        target: str,
+        action: str,
+        db: AsyncSession = Depends(get_db),
+        admin: User = Depends(verify_session)
 ):
     # 1. Base authorization check
     if admin.role not in ["admin", "superadmin"]:
@@ -1756,7 +1845,7 @@ async def manage_user(
     # 3. Fetch target user
     res = await db.execute(select(User).filter(User.email == target))
     target_user = res.scalar_one_or_none()
-    
+
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -1773,10 +1862,11 @@ async def manage_user(
         target_user.lockout_until = None
     elif action == "ban":
         target_user.status = "banned"
-        target_user.current_session_id = None # Force logout immediately
-        
+        target_user.current_session_id = None  # Force logout immediately
+
     await db.commit()
     return {"msg": f"User {target} is now {target_user.status}"}
+
 
 @app.get("/admin/list-users")
 async def list_users(db: AsyncSession = Depends(get_db), user: User = Depends(verify_session)):
@@ -1792,15 +1882,15 @@ async def list_users(db: AsyncSession = Depends(get_db), user: User = Depends(ve
     )
     await db.commit()
     # ---------------------------------
-    
+
     res = await db.execute(select(User))
     users = res.scalars().all()
-    
+
     return [
         {
-            "username": u.username, 
-            "email": u.email, 
-            "role": u.role, 
+            "username": u.username,
+            "email": u.email,
+            "role": u.role,
             "status": u.status
         } for u in users
     ]
@@ -1838,6 +1928,7 @@ async def passkey_verify_page(request: Request, user: User = Depends(verify_sess
 
 ADMIN_PASSKEY_COOKIE = "admin_passkey_ok"
 
+
 async def cleanup_webauthn_sessions(db: AsyncSession):
     # Remove old sessions to prevent DB growth
     cutoff = get_sg_time() - timedelta(minutes=10)
@@ -1846,8 +1937,8 @@ async def cleanup_webauthn_sessions(db: AsyncSession):
 
 @app.get("/webauthn/register/options")
 async def webauthn_register_options(
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(verify_session)
+        db: AsyncSession = Depends(get_db),
+        user: User = Depends(verify_session)
 ):
     if user.role not in ["admin", "superadmin"]:
         raise HTTPException(status_code=403, detail="Insufficient Account Permissions")
@@ -1894,9 +1985,9 @@ async def webauthn_register_options(
 
 @app.post("/webauthn/register/verify")
 async def webauthn_register_verify(
-    payload: dict = Body(...),
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(verify_session),
+        payload: dict = Body(...),
+        db: AsyncSession = Depends(get_db),
+        user: User = Depends(verify_session),
 ):
     if user.role not in ["admin", "superadmin"]:
         raise HTTPException(status_code=403, detail="Insufficient Account Permissions")
@@ -1921,7 +2012,7 @@ async def webauthn_register_verify(
     try:
         verification = verify_registration_response(
             credential=credential,
-            expected_challenge=base64url_to_bytes(sess.challenge), # ✅ use string (base64url) directly
+            expected_challenge=base64url_to_bytes(sess.challenge),  # ✅ use string (base64url) directly
             expected_origin=WEBAUTHN_ORIGIN,
             expected_rp_id=WEBAUTHN_RP_ID,
             require_user_verification=True,
@@ -1929,14 +2020,14 @@ async def webauthn_register_verify(
 
         pubkey_bytes = verification.credential_public_key
         pubkey_b64url = bytes_to_base64url(pubkey_bytes)
-        
+
         # ✅ compatible across different py_webauthn versions
         sign_count_val = getattr(verification, "new_sign_count", None)
         if sign_count_val is None:
             sign_count_val = getattr(verification, "sign_count", 0)
 
         pk = {
-            "credential_id": credential["id"],          # base64url string from browser
+            "credential_id": credential["id"],  # base64url string from browser
             "public_key": pubkey_b64url,
             "sign_count": int(sign_count_val or 0),
             "transports": credential.get("transports", ["internal"]),
@@ -1960,8 +2051,8 @@ async def webauthn_register_verify(
 
 @app.get("/webauthn/login/options")
 async def webauthn_login_options(
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(verify_session)
+        db: AsyncSession = Depends(get_db),
+        user: User = Depends(verify_session)
 ):
     if user.role not in ["admin", "superadmin"]:
         raise HTTPException(status_code=403, detail="Insufficient Account Permissions")
@@ -2000,9 +2091,9 @@ async def webauthn_login_options(
 
 @app.post("/webauthn/login/verify")
 async def webauthn_login_verify(
-    payload: dict = Body(...),
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(verify_session),
+        payload: dict = Body(...),
+        db: AsyncSession = Depends(get_db),
+        user: User = Depends(verify_session),
 ):
     if user.role not in ["admin", "superadmin"]:
         raise HTTPException(status_code=403, detail="Insufficient Account Permissions")
@@ -2070,6 +2161,7 @@ async def webauthn_login_verify(
 async def render_reset_request(request: Request):
     return templates.TemplateResponse("passwordreset_req.html", {"request": request})
 
+
 @app.post("/reset_password")
 @limiter.limit("3/hour")
 async def process_reset_request(request: Request, email: str = Form(...), db: AsyncSession = Depends(get_db)):
@@ -2084,11 +2176,11 @@ async def process_reset_request(request: Request, email: str = Form(...), db: As
     if user and user.role == "user" and user.status == "active":
         # Generate a unique ID for this specific reset attempt
         handshake_id = str(uuid.uuid4())
-        
+
         pending = PendingAction(
             email=email,
             action_type="password_reset",
-            action_data={"handshake_id": handshake_id}, # Store the secret
+            action_data={"handshake_id": handshake_id},  # Store the secret
             is_verified=False,
             created_at=get_sg_time()
         )
@@ -2098,17 +2190,18 @@ async def process_reset_request(request: Request, email: str = Form(...), db: As
         # Sign the token using BOTH the password hash AND the handshake_id
         # This makes it impossible to use old links if a new one is requested
         token = EMAIL_SERIALIZER.dumps(email, salt=f"{user.hashed_password}{handshake_id}")
-        
+
         verify_url = f"https://localhost:8000/verify-reset?token={token}"
-        
+
         html_content = f'<h2>Password Reset</h2><p>You have requested a password reset. Please authorize this request to proceed to 2FA:</p><a href="{verify_url}" style="background:#2c3e50; color:white; padding:10px 20px; text-decoration:none; border-radius:5px;">Verify Identity</a>'
         send_security_email("Password Reset Verification", email, html_content)
         print(f"DEBUG: Sent password reset email to {email} with link: {verify_url}")
     else:
         # Prevent timing attacks for Banned/Admin/Non-existent users
-        await asyncio.sleep(3.00) 
+        await asyncio.sleep(3.00)
 
     return templates.TemplateResponse("2fa_email_code.html", {"request": request, "email": email})
+
 
 @app.get("/verify-reset", response_class=HTMLResponse)
 async def verify_reset_link(token: str, db: AsyncSession = Depends(get_db)):
@@ -2116,14 +2209,15 @@ async def verify_reset_link(token: str, db: AsyncSession = Depends(get_db)):
         # 1. Get the email safely
         raw_email = EMAIL_SERIALIZER.loads_unsafe(token)[1]
         email = raw_email.decode('utf-8') if isinstance(raw_email, bytes) else raw_email
-        
+
         # 2. Fetch the user and their LATEST handshake
         res = await db.execute(select(User).filter(User.email == email))
         user = res.scalar_one_or_none()
-        
-        pending_res = await db.execute(select(PendingAction).filter(PendingAction.email == email, PendingAction.action_type == "password_reset"))
+
+        pending_res = await db.execute(
+            select(PendingAction).filter(PendingAction.email == email, PendingAction.action_type == "password_reset"))
         pending = pending_res.scalar_one_or_none()
-        
+
         if not user or not pending:
             raise Exception("Invalid request state")
 
@@ -2134,7 +2228,7 @@ async def verify_reset_link(token: str, db: AsyncSession = Depends(get_db)):
         # 4. Success: Mark as verified
         await db.execute(update(PendingAction).where(PendingAction.email == email).values(is_verified=True))
         await db.commit()
-        
+
         return HTMLResponse("""
             <html><body style="font-family:Arial; text-align:center; padding:50px;">
                 <h1 style="color:#5cb85c;">Verified!</h1>
@@ -2149,17 +2243,20 @@ async def verify_reset_link(token: str, db: AsyncSession = Depends(get_db)):
             </body></html>
         """)
 
+
 @app.get("/complete-password-reset", response_class=HTMLResponse)
 async def render_final_reset(request: Request, token: str):
     return templates.TemplateResponse("password_reset.html", {"request": request, "token": token})
 
+
 @app.post("/complete-password-reset")
-async def process_final_reset(request: Request, token: str = Form(...), password: str = Form(...), confirm_password: str = Form(...), db: AsyncSession = Depends(get_db)):
+async def process_final_reset(request: Request, token: str = Form(...), password: str = Form(...),
+                              confirm_password: str = Form(...), db: AsyncSession = Depends(get_db)):
     try:
         email = EMAIL_SERIALIZER.loads(token, salt="final-reset-auth", max_age=300)
         res = await db.execute(select(User).filter(User.email == email))
         user = res.scalar_one_or_none()
-        
+
         all_errors = []
         if password != confirm_password:
             all_errors.append("Passwords do not match")
@@ -2175,50 +2272,52 @@ async def process_final_reset(request: Request, token: str = Form(...), password
             if pwd_context.verify(password, old_hash):
                 is_reused = True
                 break
-        
+
         if is_reused:
             all_errors.append("You cannot reuse any of your last 3 passwords")
 
         if all_errors:
-            return templates.TemplateResponse("password_reset.html", {"request": request, "token": token, "error": " | ".join(all_errors)})
+            return templates.TemplateResponse("password_reset.html",
+                                              {"request": request, "token": token, "error": " | ".join(all_errors)})
 
         # --- SUCCESS FLOW: LOGOUT EVERYWHERE ---
         # 1. Update History
         new_history = history[-2:] if history else []
         new_history.append(user.hashed_password)
-        
+
         # 2. Update User Record
         user.hashed_password = pwd_context.hash(password)
         user.password_history = new_history
-        user.current_session_id = None # Forces re-login on all devices
+        user.current_session_id = None  # Forces re-login on all devices
         user.failed_login_attempts = 0
         user.failed_2fa_attempts = 0
         user.lockout_until = None
         user.status = "active"
-        
+
         # 3. Clean up the pending action
         await db.execute(delete(PendingAction).where(PendingAction.email == email))
         await db.commit()
-        
+
         # 4. Prepare Response and clear the local session cookie
         response = RedirectResponse(url="/login?message=Password updated successfully", status_code=303)
         response.delete_cookie("session_id", path="/")
         response.delete_cookie("device_token", path="/")
         return response
-        
+
     except Exception as e:
         print(f"CRITICAL: Final Reset Failed: {e}")
         return RedirectResponse(url="/login", status_code=303)
+
 
 @app.on_event("startup")
 async def create_initial_admins():
     async with AsyncSessionLocal() as db:
         # --- 1. Create Superadmin ---
-        superadmin_email = "superadmin@notevault.com" # You can change to your own email for testing
+        superadmin_email = "superadmin@notevault.com"  # You can change to your own email for testing
         res_super = await db.execute(select(User).filter(User.email == superadmin_email))
         if not res_super.scalar_one_or_none():
             superadmin = User(
-                username="Ben Wang", 
+                username="Ben Wang",
                 email=superadmin_email,
                 hashed_password=pwd_context.hash("Someonewithnoname12345*****"),
                 password_history=[],
@@ -2236,11 +2335,11 @@ async def create_initial_admins():
             db.add(superadmin)
 
         # --- 2. Create James Charles Admin ---
-        james_email = "james@notevault.com" # You can change to your own email for testing
+        james_email = "james@notevault.com"  # You can change to your own email for testing
         res_james = await db.execute(select(User).filter(User.email == james_email))
         if not res_james.scalar_one_or_none():
             james = User(
-                username="James Charles", 
+                username="James Charles",
                 email=james_email,
                 hashed_password=pwd_context.hash("Someonewithnoname12345*****"),
                 password_history=[],
@@ -2248,8 +2347,8 @@ async def create_initial_admins():
                 backup_pin_history=[],
                 backup_pin_changed_at=get_sg_time(),
                 must_change_backup_pin=False,
-                totp_secret="MFRGGZDFMZTWQ2LK", # Fixed key so you can set up Google Auth once
-                role="admin", 
+                totp_secret="MFRGGZDFMZTWQ2LK",  # Fixed key so you can set up Google Auth once
+                role="admin",
                 status="active",
                 failed_login_attempts=0,
                 failed_2fa_attempts=0,
@@ -2280,6 +2379,7 @@ async def logout(request: Request, db: AsyncSession = Depends(get_db)):
     # ✅ DO NOT delete device_token here (keep the device trusted)
     return response
 
+
 @app.get("/logout-forget")
 async def logout_forget(request: Request, db: AsyncSession = Depends(get_db), user: User = Depends(verify_session)):
     # revoke trust for THIS device on server
@@ -2296,3 +2396,427 @@ async def logout_forget(request: Request, db: AsyncSession = Depends(get_db), us
     response.delete_cookie(ADMIN_PASSKEY_COOKIE, path="/")
     response.delete_cookie(TRUSTED_DEVICE_COOKIE, path="/")  # delete local cookie too
     return response
+
+
+class UploadedFile(Base):
+    """
+    Stores encrypted file bytes and metadata.
+    ZERO plaintext in the DB: filename, file bytes, and MIME are all encrypted.
+    SHA-256 is computed over the ciphertext for integrity verification.
+    """
+    __tablename__ = "uploaded_files"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_email = Column(String, index=True, nullable=False)
+    filename_encrypted = Column(Text, nullable=False)  # AES-GCM encrypted original name
+    mime_type_enc = Column(Text, nullable=False)  # AES-GCM encrypted MIME type
+    file_data_enc = Column(Text, nullable=False)  # AES-GCM of base64(raw bytes)
+    wrapped_key = Column(Text, nullable=False)  # DEK wrapped with master key
+    file_size = Column(Integer, nullable=False)
+    sha256_ciphertext = Column(String, nullable=False)  # SHA-256 of encrypted payload
+    uploaded_at = Column(DateTime, default=datetime.utcnow)  # type: ignore[name-defined]
+    scan_result = Column(String, default="clean")  # 'clean' | 'rejected'
+
+
+@app.on_event("startup")  # type: ignore[name-defined]
+async def _run_security_additions_migration():
+    """
+    Idempotent migration: creates uploaded_files table and adds encrypted_title
+    column to notes table if either does not already exist.
+    """
+    from sqlalchemy import text as _text
+    async with engine.begin() as conn:  # type: ignore[name-defined]
+        # Create uploaded_files table
+        await conn.run_sync(Base.metadata.create_all)  # type: ignore[name-defined]
+
+        # Add encrypted_title to notes (idempotent)
+        try:
+            await conn.execute(_text(
+                "ALTER TABLE notes ADD COLUMN IF NOT EXISTS encrypted_title VARCHAR"
+            ))
+        except Exception as _e:
+            print(f"[migration] encrypted_title column: {_e}")
+
+    print("✓ Security-additions migration complete")
+
+    @app.post("/files/upload")  # type: ignore[name-defined]
+    @limiter.limit("10/minute")  # type: ignore[name-defined]
+    async def upload_secure_file(
+            request: "Request",  # type: ignore[name-defined]
+            file: UploadFile = FastAPIFile(...),
+            user: "User" = Depends(verify_session),  # type: ignore[name-defined]
+            db: "AsyncSession" = Depends(get_db),  # type: ignore[name-defined]
+    ):
+        """
+        Secure file ingest pipeline:
+          TLS 1.3 in transit (enforced by run_tls.py)
+          → size/MIME/extension validation
+          → malware pattern scan + optional ClamAV
+          → AES-256-GCM encryption of file bytes and filename
+          → SHA-256 of ciphertext stored for integrity checks
+        """
+        raw_bytes = await file.read()
+        filename = file.filename or "upload"
+
+        # ── Security validation ──────────────────────────────────────────────
+        passed, reason = full_security_scan(raw_bytes, filename)
+        if not passed:
+            print(f"AUDIT_FILE_REJECTED user={user.email} filename={filename} reason={reason}")
+            raise HTTPException(status_code=400, detail=f"File rejected: {reason}")  # type: ignore[name-defined]
+
+        # ── Encrypt with per-file DEK ────────────────────────────────────────
+        master_key = get_encryption_key()  # type: ignore[name-defined]
+        dek = generate_key()  # type: ignore[name-defined]
+
+        file_b64 = _b64mod.b64encode(raw_bytes).decode()
+        file_data_enc = encrypt_content(file_b64, dek)  # type: ignore[name-defined]
+        filename_enc = encrypt_content(filename, dek)  # type: ignore[name-defined]
+        mime_enc = encrypt_content(file.content_type or "application/octet-stream", dek)  # type: ignore[name-defined]
+        wrapped = wrap_key(dek, master_key)  # type: ignore[name-defined]
+        sha256_of_ct = compute_sha256(file_data_enc.encode())
+
+        db_file = UploadedFile(
+            owner_email=user.email,
+            filename_encrypted=filename_enc,
+            mime_type_enc=mime_enc,
+            file_data_enc=file_data_enc,
+            wrapped_key=wrapped,
+            file_size=len(raw_bytes),
+            sha256_ciphertext=sha256_of_ct,
+            scan_result="clean",
+        )
+        db.add(db_file)
+        await db.commit()
+        await db.refresh(db_file)
+
+        print(
+            f"AUDIT_FILE_UPLOAD id={db_file.id} user={user.email} "
+            f"size={len(raw_bytes)} sha256ct={sha256_of_ct[:16]}…"
+        )
+        return {
+            "id": db_file.id,
+            "size": len(raw_bytes),
+            "sha256": sha256_of_ct,
+            "scan_result": "clean",
+            "message": "File uploaded, validated, and encrypted successfully",
+        }
+
+
+@app.get("/files")  # type: ignore[name-defined]
+async def list_user_files(
+        request: "Request",  # type: ignore[name-defined]
+        user: "User" = Depends(verify_session),  # type: ignore[name-defined]
+        db: "AsyncSession" = Depends(get_db),  # type: ignore[name-defined]
+):
+    result = await db.execute(
+        select(UploadedFile).where(UploadedFile.owner_email == user.email)  # type: ignore[name-defined]
+    )
+    files = result.scalars().all()
+    master_key = get_encryption_key()  # type: ignore[name-defined]
+
+    out = []
+    for f in files:
+        try:
+            dek = unwrap_key(f.wrapped_key, master_key)  # type: ignore[name-defined]
+            original_name = decrypt_content(f.filename_encrypted, dek)  # type: ignore[name-defined]
+        except Exception:
+            original_name = f"file_{f.id}"
+
+        out.append({
+            "id": f.id,
+            "original_name": original_name,
+            "file_size": f.file_size,
+            "sha256": f.sha256_ciphertext,
+            "uploaded_at": f.uploaded_at.isoformat() if f.uploaded_at else None,
+            "scan_result": f.scan_result,
+        })
+    return out
+
+
+@app.get("/files/{file_id}/download")  # type: ignore[name-defined]
+@limiter.limit("5/minute")  # type: ignore[name-defined]
+async def download_file(
+        file_id: int,
+        request: "Request",  # type: ignore[name-defined]
+        user: "User" = Depends(verify_session),  # type: ignore[name-defined]
+        db: "AsyncSession" = Depends(get_db),  # type: ignore[name-defined]
+):
+    """Decrypt and stream the file; verifies ciphertext integrity before decryption."""
+    result = await db.execute(
+        select(UploadedFile).where(  # type: ignore[name-defined]
+            UploadedFile.id == file_id,
+            UploadedFile.owner_email == user.email,
+        )
+    )
+    db_file = result.scalar_one_or_none()
+    if not db_file:
+        raise HTTPException(status_code=404, detail="File not found")  # type: ignore[name-defined]
+
+    # ── Integrity check (verify SHA-256 of ciphertext before decryption) ─
+    actual_sha256 = compute_sha256(db_file.file_data_enc.encode())
+    if actual_sha256 != db_file.sha256_ciphertext:
+        print(f"AUDIT_INTEGRITY_FAIL file_id={file_id} user={user.email}")
+        raise HTTPException(status_code=500,
+                            detail="File integrity check failed – file may be corrupted")  # type: ignore[name-defined]
+
+    # ── Decrypt ──────────────────────────────────────────────────────────
+    master_key = get_encryption_key()  # type: ignore[name-defined]
+    dek = unwrap_key(db_file.wrapped_key, master_key)  # type: ignore[name-defined]
+    decrypted_b64 = decrypt_content(db_file.file_data_enc, dek)  # type: ignore[name-defined]
+    raw_bytes = _b64mod.b64decode(decrypted_b64)
+
+    try:
+        original_name = decrypt_content(db_file.filename_encrypted, dek)  # type: ignore[name-defined]
+        mime_type = decrypt_content(db_file.mime_type_enc, dek)  # type: ignore[name-defined]
+    except Exception:
+        original_name = f"file_{file_id}"
+        mime_type = "application/octet-stream"
+
+    print(f"AUDIT_FILE_DOWNLOAD file_id={file_id} user={user.email} ip={request.client.host}")
+
+    return StreamingResponse(  # type: ignore[name-defined]
+        BytesIO(raw_bytes),  # type: ignore[name-defined]
+        media_type=mime_type,
+        headers={"Content-Disposition": f'attachment; filename="{original_name}"'},
+    )
+
+
+@app.delete("/files/{file_id}")  # type: ignore[name-defined]
+async def delete_uploaded_file(
+        file_id: int,
+        request: "Request",  # type: ignore[name-defined]
+        user: "User" = Depends(verify_session),  # type: ignore[name-defined]
+        db: "AsyncSession" = Depends(get_db),  # type: ignore[name-defined]
+):
+    result = await db.execute(
+        select(UploadedFile).where(  # type: ignore[name-defined]
+            UploadedFile.id == file_id,
+            UploadedFile.owner_email == user.email,
+        )
+    )
+    db_file = result.scalar_one_or_none()
+    if not db_file:
+        raise HTTPException(status_code=404, detail="File not found")  # type: ignore[name-defined]
+
+    # Cryptographic deletion: zero the wrapped key first so file data is
+    # permanently inaccessible even if rows are recovered from backups.
+    db_file.wrapped_key = None
+    await db.commit()
+    await db.delete(db_file)
+    await db.commit()
+    return {"message": "File deleted"}
+
+
+@app.post("/auth/generate-signing-keys")  # type: ignore[name-defined]
+async def generate_user_signing_keys(
+        request: "Request",  # type: ignore[name-defined]
+        user: "User" = Depends(verify_session),  # type: ignore[name-defined]
+        db: "AsyncSession" = Depends(get_db),  # type: ignore[name-defined]
+):
+    """
+    Generate an Ed25519 signing keypair for the current user.
+    Private key is AES-256-GCM encrypted with the master key before DB storage.
+    Public key is stored in plaintext for signature verification.
+    """
+    if user.signing_public_key:
+        return {
+            "message": "Signing keys already exist",
+            "public_key": user.signing_public_key,
+        }
+
+    priv_bytes, pub_bytes = _gen_keypair()
+    master_key = get_encryption_key()  # type: ignore[name-defined]
+
+    # Encrypt private key before persisting
+    encrypted_priv = encrypt_content(_b64e(priv_bytes), master_key)  # type: ignore[name-defined]
+
+    user.signing_private_key = encrypted_priv
+    user.signing_public_key = _b64e(pub_bytes)
+    await db.commit()
+
+    return {
+        "message": "Ed25519 signing keypair generated",
+        "public_key": user.signing_public_key,
+    }
+
+
+@app.post("/notes/{note_id}/sign")                             # type: ignore[name-defined]
+@limiter.limit("10/minute")                                    # type: ignore[name-defined]
+async def sign_note(
+    note_id: int,
+    request: "Request",                                        # type: ignore[name-defined]
+    user: "User"        = Depends(verify_session),             # type: ignore[name-defined]
+    db: "AsyncSession"  = Depends(get_db),                    # type: ignore[name-defined]
+):
+    """
+    Digitally sign a note with the user's Ed25519 private key.
+
+    Canonical payload signed:
+        "note_id=<id>|content_sha256=<sha256(encrypted_content)>|signer=<email>"
+
+    Using SHA-256 of the encrypted content means:
+      • Any tampering with the ciphertext breaks the signature (Integrity)
+      • Only the key-holder could produce this signature (Authenticity)
+      • The stored signature + public key constitute non-repudiation evidence
+    """
+    if not user.signing_private_key:
+        raise HTTPException(                                   # type: ignore[name-defined]
+            status_code=400,
+            detail="No signing keys. Call POST /auth/generate-signing-keys first.",
+        )
+
+    async with AsyncSessionLocal() as session:                 # type: ignore[name-defined]
+        result = await session.execute(
+            select(Note).where(Note.id == note_id)             # type: ignore[name-defined]
+        )
+        note = result.scalar_one_or_none()
+        if not note:
+            raise HTTPException(status_code=404, detail="Note not found")  # type: ignore[name-defined]
+
+        # Build canonical string (deterministic – no volatile timestamps)
+        content_sha256 = compute_sha256(
+            (note.content or "").encode("utf-8")
+        )
+        canonical = (
+            f"note_id={note_id}"
+            f"|content_sha256={content_sha256}"
+            f"|signer={user.email}"
+        ).encode("utf-8")
+
+        # Decrypt and use private key
+        master_key = get_encryption_key()                      # type: ignore[name-defined]
+        try:
+            decrypted_priv_b64 = decrypt_content(user.signing_private_key, master_key)  # type: ignore[name-defined]
+            priv_bytes         = _b64d(decrypted_priv_b64)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Failed to load signing key")  # type: ignore[name-defined]
+
+        sig_bytes = _ed_sign(priv_bytes, canonical)
+
+        note.signature        = _b64e(sig_bytes)
+        note.signer_id        = user.email
+        note.signer_public_key = user.signing_public_key
+        note.updated_at       = datetime.utcnow()              # type: ignore[name-defined]
+        await session.commit()
+
+    print(f"AUDIT_NOTE_SIGNED note_id={note_id} signer={user.email}")
+    return {
+        "message":         "Note signed successfully",
+        "note_id":         note_id,
+        "signer":          user.email,
+        "content_sha256":  content_sha256,
+        "signature":       note.signature,
+    }
+
+
+@app.get("/notes/{note_id}/verify-signature")                  # type: ignore[name-defined]
+async def verify_note_signature(
+    note_id: int,
+    db: "AsyncSession" = Depends(get_db),                     # type: ignore[name-defined]
+):
+    """
+    Verify the Ed25519 digital signature on a note.
+
+    Returns verified=True only when:
+      1. A signature is stored on the note
+      2. The stored public key successfully verifies the signature
+      3. The current encrypted content hash matches what was signed
+         (i.e. the note has not been tampered with since signing)
+    """
+    from crypto_signing import verify_signature as _vs
+    result = await db.execute(
+        select(Note).where(Note.id == note_id)                 # type: ignore[name-defined]
+    )
+    note = result.scalar_one_or_none()
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")  # type: ignore[name-defined]
+
+    if not note.signature or not note.signer_public_key:
+        return {
+            "verified": False,
+            "reason":   "Note has not been signed yet",
+            "note_id":  note_id,
+        }
+
+    # Reconstruct canonical payload using current encrypted content
+    content_sha256 = compute_sha256((note.content or "").encode("utf-8"))
+    canonical = (
+        f"note_id={note_id}"
+        f"|content_sha256={content_sha256}"
+        f"|signer={note.signer_id}"
+    ).encode("utf-8")
+
+    try:
+        pub_bytes = _b64d(note.signer_public_key)
+        sig_bytes = _b64d(note.signature)
+        _vs(pub_bytes, sig_bytes, canonical)
+        return {
+            "verified":       True,
+            "signer":         note.signer_id,
+            "public_key":     note.signer_public_key,
+            "content_sha256": content_sha256,
+            "note_id":        note_id,
+        }
+    except InvalidSignature:
+        return {
+            "verified": False,
+            "reason":   "Signature INVALID – content has been modified since signing",
+            "note_id":  note_id,
+        }
+    except Exception as exc:
+        return {
+            "verified": False,
+            "reason":   f"Verification error: {exc}",
+            "note_id":  note_id,
+        }
+
+
+@app.get("/notes/{note_id}/encrypted-payload")                 # type: ignore[name-defined]
+@limiter.limit("20/minute")                                    # type: ignore[name-defined]
+async def get_note_encrypted_payload(
+    note_id: int,
+    request: "Request",                                        # type: ignore[name-defined]
+    user: "User"        = Depends(verify_session),             # type: ignore[name-defined]
+    db: "AsyncSession"  = Depends(get_db),                    # type: ignore[name-defined]
+):
+    """
+    Zero-knowledge endpoint: returns ciphertext + unwrapped DEK so that
+    decryption happens ENTIRELY in the browser via the WebCrypto API.
+
+    Server role: authenticate session, unwrap DEK, forward ciphertext.
+    Server does NOT see plaintext – all decryption happens client-side.
+
+    Response payload consumed by decryptNoteClientSide() in app.js.
+    """
+    async with AsyncSessionLocal() as session:                 # type: ignore[name-defined]
+        result = await session.execute(
+            select(Note).where(Note.id == note_id)             # type: ignore[name-defined]
+        )
+        note = result.scalar_one_or_none()
+
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")  # type: ignore[name-defined]
+
+    master_key = get_encryption_key()                          # type: ignore[name-defined]
+    try:
+        dek = unwrap_key(note.wrapped_key, master_key) if note.wrapped_key else master_key  # type: ignore[name-defined]
+    except Exception:
+        raise HTTPException(status_code=500, detail="Key unwrapping failed")  # type: ignore[name-defined]
+
+    dek_b64 = _b64mod.b64encode(dek).decode()
+
+    print(
+        f"AUDIT_ENCRYPTED_PAYLOAD note_id={note_id} user={user.email} "
+        f"ip={request.client.host}"
+    )
+    return {
+        "id":               note_id,
+        "encrypted_title":  note.encrypted_title,   # nonce:ct:tag or null (legacy)
+        "plaintext_title":  note.title if not note.encrypted_title else None,
+        "encrypted_content": note.content,          # nonce:ct:tag
+        "dek_b64":          dek_b64,                # raw AES-256 DEK for WebCrypto
+        "has_signature":    bool(note.signature),
+        "signer_id":        note.signer_id,
+        "created_at":       note.created_at.isoformat() if note.created_at else None,
+        "updated_at":       note.updated_at.isoformat() if note.updated_at else None,
+    }

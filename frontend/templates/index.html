@@ -91,15 +91,42 @@
     <button id="saveBtn" onclick="saveNote()">Save Note</button>
     <button onclick="clearNoteForm()">Clear</button>
     <hr>
+    <div class="signing-panel">
+      <h4>Note Signing</h4>
+      <p style="font-size:13px; color:#555; margin:0 0 10px;">
+        Generate your signing keypair once, then use <strong>Sign</strong> on any note to
+        create a tamper-evident digital signature. Use <strong>Secure View</strong>
+        to decrypt and verify notes entirely in the browser.
+      </p>
+      <button id="genKeysBtn" onclick="generateSigningKeys()">Generate Signing Keys</button>
+      <div id="signingStatus" class="signing-status"></div>
+    </div>
     <h3>Your Notes</h3>
     <div id="noteList"></div>
   </div>
 
   <div id="files" class="section" style="display:none;">
-    <h2>File Upload</h2>
-    <input type="file" id="fileInput">
-    <button onclick="uploadFile()">Upload</button>
-    <div id="fileList"></div>
+    <h2>Secure File Storage</h2>
+
+    <!-- Upload control -->
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <input type="file" id="fileInput" accept=".pdf,.txt,.csv,.docx,.xlsx,.pptx,.jpg,.jpeg,.png,.gif,.webp">
+      <button onclick="uploadFile()">Upload</button>
+    </div>
+    <p class="file-type-hint">
+      Allowed: PDF, TXT, CSV, DOCX, XLSX, PPTX, JPG, PNG, GIF, WEBP (Max 10 MB)
+    </p>
+
+    <!-- Upload status / progress -->
+    <div id="uploadProgress"></div>
+    <div id="uploadStatus"></div>
+
+    <hr style="margin:20px 0;">
+
+    <h3>Your Files</h3>
+    <div id="fileList">
+      <p class="no-files">Loading…</p>
+    </div>
   </div>
 
   <div id="dashboard" class="section" style="display:none;">
@@ -136,6 +163,12 @@
 
   <!-- Link JS -->
   <script src="/static/js/app.js?v=1.2"></script>
+
+  <!-- Secure View Modal (client-side decryption) -->
+  <div id="secureViewModal" role="dialog" aria-modal="true" aria-label="Secure Note View">
+    <div class="sv-modal-inner" id="secureViewBody"></div>
+  </div>
+
 </body>
 
 </html>
