@@ -18,9 +18,19 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from passlib.context import CryptContext
 from itsdangerous import URLSafeTimedSerializer
-from backend.crypto import load_key, encrypt_content, decrypt_content, generate_key, wrap_key, unwrap_key
+from backend.crypto import (
+    load_key,
+    encrypt_content,
+    decrypt_content,
+    generate_key,
+    save_key,
+    key_exists,
+    wrap_key,
+    unwrap_key,
+)
 from backend.activity import init_migration, log_activity
-from backend.anomaly import check_anomaly
+from backend.anomaly import check_anomaly, load_model
+from pathlib import Path
 from fastapi import Cookie
 from typing import Optional
 import asyncio
@@ -82,7 +92,7 @@ APP_NAME = "NoteVault"
 
 # Database setup, change to your own password here. Make sure PostgreSQL is running. To be encrypted in the future.
 # password: 1m1f1b1m
-DATABASE_URL = "postgresql+asyncpg://postgres:1m1f1b1m@localhost/notevault"
+DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/notevault"
 Base = declarative_base()
 
 # Load encryption key on startup
@@ -269,6 +279,17 @@ async def startup():
             print("✓ Migration: Added wrapped_key column to notes table")
         except Exception as e:
             print(f"Migration note: wrapped_key column may already exist or migration skipped: {e}")
+        
+        # Migration: Add last_activity_at column to users table
+        try:
+            from sqlalchemy import text
+            await conn.execute(text("""
+                ALTER TABLE users 
+                ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMP
+            """))
+            print("✓ Migration: Added last_activity_at column to users table")
+        except Exception as e:
+            print(f"Migration note: last_activity_at column may already exist or migration skipped: {e}")
 
     # Ensure user_activity table exists for activity logging
     try:
@@ -1549,6 +1570,17 @@ async def finalize_signup(
     )
     
     db.add(new_user)
+
+    # Ensure master encryption key exists; generate and save automatically on first user creation
+    try:
+        if not key_exists():
+            master_key = generate_key()
+            save_key(master_key)
+            print("DEBUG: Generated master encryption key during user signup")
+    except Exception as e:
+        # Log error but do not block user creation -- administrators should investigate
+        print(f"CRITICAL: Failed to generate/save master encryption key: {e}")
+
     await db.execute(delete(PendingAction).where(PendingAction.email == email))
     await db.commit()
     
@@ -1658,6 +1690,8 @@ async def login_process(
             "login.html",
             {"request": request, "error": "Incorrect email or password"}
         )
+    
+
 
     # 6. Device Recognition Check (SERVER-SIDE TRUSTED DEVICES)
     is_recognized_device = await is_trusted_device(request, user, db)
@@ -1725,6 +1759,182 @@ async def login_process(
     )
 
     return response
+
+
+# --- USER DASHBOARD ENDPOINTS ---
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def user_dashboard(request: Request, user: User = Depends(verify_session)):
+    """Serve user security dashboard"""
+    return templates.TemplateResponse("user_dashboard.html", {"request": request, "user": user})
+
+
+@app.get("/dashboard/activity")
+async def user_activity(limit: int = 50, offset: int = 0, current: User = Depends(verify_session), db: AsyncSession = Depends(get_db)):
+    """Fetch user's own login activity with pagination"""
+    if not current.id:
+        raise HTTPException(status_code=400, detail="User ID not found")
+    
+    # Fetch activity records for this user
+    q = """
+        SELECT id, user_id, login_time, ip_address, device_info, action, success
+        FROM user_activity
+        WHERE user_id = :user_id
+        ORDER BY login_time DESC
+        LIMIT :limit OFFSET :offset
+    """
+    res = await db.execute(__import__("sqlalchemy").text(q), {"user_id": current.id, "limit": limit, "offset": offset})
+    rows = res.fetchall()
+    
+    # Get total count
+    count_q = "SELECT COUNT(*) FROM user_activity WHERE user_id = :user_id"
+    count_res = await db.execute(__import__("sqlalchemy").text(count_q), {"user_id": current.id})
+    total = count_res.scalar()
+    
+    out = []
+    for r in rows:
+        out.append({
+            "id": int(r[0]),
+            "login_time": r[2].isoformat() if r[2] else None,
+            "ip_address": r[3],
+            "device_info": r[4],
+            "action": r[5],
+            "success": bool(r[6]) if r[6] is not None else None,
+        })
+    
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "activities": out
+    }
+
+
+@app.get("/dashboard/summary")
+async def user_summary(current: User = Depends(verify_session), db: AsyncSession = Depends(get_db)):
+    """Get user security summary: login count, last login, suspicious activity flag"""
+    if not current.id:
+        raise HTTPException(status_code=400, detail="User ID not found")
+    
+    # Total logins
+    count_q = "SELECT COUNT(*) FROM user_activity WHERE user_id = :user_id"
+    count_res = await db.execute(__import__("sqlalchemy").text(count_q), {"user_id": current.id})
+    total_logins = count_res.scalar() or 0
+    
+    # Last login
+    last_q = """
+        SELECT login_time, ip_address, device_info
+        FROM user_activity
+        WHERE user_id = :user_id AND success = true
+        ORDER BY login_time DESC
+        LIMIT 1
+    """
+    last_res = await db.execute(__import__("sqlalchemy").text(last_q), {"user_id": current.id})
+    last_row = last_res.fetchone()
+    
+    # Failed logins (last 24 hours)
+    failed_q = """
+        SELECT COUNT(*)
+        FROM user_activity
+        WHERE user_id = :user_id AND success = false AND login_time > NOW() - INTERVAL '1 day'
+    """
+    failed_res = await db.execute(__import__("sqlalchemy").text(failed_q), {"user_id": current.id})
+    failed_24h = failed_res.scalar() or 0
+    
+    return {
+        "total_logins": total_logins,
+        "failed_logins_24h": failed_24h,
+        "last_login_time": last_row[0].isoformat() if last_row and last_row[0] else None,
+        "last_login_ip": last_row[1] if last_row else None,
+        "last_login_device": last_row[2] if last_row else None,
+        "status": current.status,
+        "role": current.role,
+        "last_activity_at": current.last_activity_at.isoformat() if current.last_activity_at else None,
+    }
+
+
+@app.get("/admin/list-users")
+async def admin_list_users(current: User = Depends(verify_session), db: AsyncSession = Depends(get_db)):
+    if current.role not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    res = await db.execute(select(User))
+    users = res.scalars().all()
+    out = []
+    for u in users:
+        out.append({
+            "id": u.id,
+            "username": u.username,
+            "email": u.email,
+            "role": u.role,
+            "status": u.status,
+            "last_activity_at": u.last_activity_at.isoformat() if getattr(u, 'last_activity_at', None) else None,
+        })
+    return out
+
+
+@app.post("/admin/manage")
+async def admin_manage(target: str = None, action: str = None, current: User = Depends(verify_session), db: AsyncSession = Depends(get_db)):
+    if current.role not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if not target or not action:
+        raise HTTPException(status_code=400, detail="Missing target or action")
+    res = await db.execute(select(User).filter(User.email == target))
+    u = res.scalar_one_or_none()
+    if not u:
+        raise HTTPException(status_code=404, detail="Target user not found")
+
+    if action == "unlock":
+        u.status = "active"
+        u.failed_login_attempts = 0
+        u.failed_2fa_attempts = 0
+        u.lockout_until = None
+    elif action == "ban":
+        u.status = "banned"
+    else:
+        raise HTTPException(status_code=400, detail="Unknown action")
+
+    await db.commit()
+    return {"msg": f"Action '{action}' applied to {target}"}
+
+
+@app.get("/admin/activity")
+async def admin_activity(limit: int = 100, current: User = Depends(verify_session), db: AsyncSession = Depends(get_db)):
+    if current.role not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    # Fetch recent activity from user_activity table
+    q = """
+        SELECT ua.id, ua.user_id, ua.login_time, ua.ip_address, ua.device_info, ua.action, ua.success, u.email
+        FROM user_activity ua LEFT JOIN users u ON ua.user_id = u.id
+        ORDER BY ua.login_time DESC LIMIT :limit
+    """
+    res = await db.execute(__import__("sqlalchemy").text(q), {"limit": limit})
+    rows = res.fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "id": int(r[0]),
+            "user_id": int(r[1]) if r[1] is not None else None,
+            "login_time": r[2].isoformat() if r[2] else None,
+            "ip_address": r[3],
+            "device_info": r[4],
+            "action": r[5],
+            "success": bool(r[6]) if r[6] is not None else None,
+            "email": r[7],
+        })
+    return out
+
+
+@app.get("/admin/anomaly")
+async def admin_anomaly(current: User = Depends(verify_session)):
+    if current.role not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    model_file = Path(__file__).parent / "anomaly_model.pkl"
+    exists = model_file.exists()
+    info = {"model_exists": exists}
+    if exists:
+        info["modified_at"] = model_file.stat().st_mtime
+    return info
+
 
 @app.get("/verify-login", response_class=HTMLResponse)
 async def verify_login_link(token: str, db: AsyncSession = Depends(get_db)):

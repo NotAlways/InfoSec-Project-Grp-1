@@ -1,6 +1,8 @@
 backend/cert.pem
 backend/key.pem
 backend/__pycache__
+cert.pem
+key.pem
 
 # Python
 __pycache__/
