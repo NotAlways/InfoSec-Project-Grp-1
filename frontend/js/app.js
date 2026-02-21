@@ -4,8 +4,12 @@ let currentNoteId = null;
 // Load notes when page first loads
 document.addEventListener("DOMContentLoaded", function () {
   console.log("Page loaded, initializing...");
-  showSection("notes");
-  loadNotes();
+
+  // ✅ Only run dashboard init on pages that actually have notes section
+  if (document.getElementById("notes")) {
+    showSection("notes");
+    loadNotes();
+  }
 });
 
 // ===== Security Dashboard (individual logs) =====
@@ -401,7 +405,15 @@ async function loadTrash() {
 function showSection(sectionId) {
   const sections = document.querySelectorAll(".section");
   sections.forEach(sec => sec.style.display = "none");
-  document.getElementById(sectionId).style.display = "block";
+
+  const target = document.getElementById(sectionId);
+  if (!target) {
+    console.warn(`showSection: section '${sectionId}' not found on this page`);
+    return; // ✅ prevents crash on admin.html
+  }
+
+  target.style.display = "block";
+
   if (sectionId === "notes") {
     loadNotes();
   }

@@ -184,11 +184,6 @@
         </div>
 
         <hr>
-        <h3>Recent Activity</h3>
-        <div id="activityWrapper"><p>Loading activity...</p></div>
-
-        <h3>Anomaly Detection</h3>
-        <div id="anomalyWrapper"><p>Loading anomaly model status...</p></div>
     </div>
 
     <script>
@@ -348,7 +343,7 @@
                     const res = await fetch('/admin/anomaly');
                     if (!res.ok) throw new Error('Failed to fetch anomaly status');
                     const info = await res.json();
-                    wrapper.innerHTML = info.model_exists ? `<p>Model present (modified: ${new Date(info.modified_at*1000).toLocaleString()})</p>` : '<p>No trained anomaly model found.</p>';
+                    wrapper.innerHTML = info.model_exists ? `<p>Model present (modified: ${new Date(info.modified_at * 1000).toLocaleString()})</p>` : '<p>No trained anomaly model found.</p>';
                 } catch (e) {
                     wrapper.innerHTML = `<p style="color:red">${e.message}</p>`;
                 }
@@ -356,7 +351,7 @@
 
             // enhance loadTableData to also load activity & anomaly
             const originalLoad = loadTableData;
-            loadTableData = async function() { await originalLoad(); await loadActivity(); await loadAnomaly(); };
+            loadTableData = async function () { await originalLoad(); await loadActivity(); await loadAnomaly(); };
 
             window.loadTableData = loadTableData;
         })();

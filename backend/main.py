@@ -92,7 +92,7 @@ APP_NAME = "NoteVault"
 
 # Database setup, change to your own password here. Make sure PostgreSQL is running. To be encrypted in the future.
 # password: 1m1f1b1m
-DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost/notevault"
+DATABASE_URL = "postgresql+asyncpg://postgres:1m1f1b1m@localhost/notevault"
 Base = declarative_base()
 
 # Load encryption key on startup
